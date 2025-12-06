@@ -1,0 +1,12 @@
+.DS_Store
+.ivy2/
+.sbt/
+.bsp/
+.metals
+.scala-build
+.vscode
+target/
+dataset/
+exercises/
+text/bdp.pdf
+**/checkpointDir/

@@ -1,0 +1,2220 @@
+[[ch:discretized-stream]]
+= Discretized Stream Processing
+
+== Batch vs. Stream Processing
+The fundamental assumption underpinning traditional data processing systems is that the dataset is bounded (i.e., finite and static). 
+Modern industrial and scientific contexts, however, generate data as _unbounded_ sequences of events, where the flow is _continuous_ and potentially _infinite_.
+
+This reality necessitates a fundamental change in processing architecture. 
+The transition from scheduled batch pipelines to continuous data ingestion is driven primarily by the severe constraints of latency. 
+The informational value of an event often diminishes proportionally to the time elapsed since it occurred, rendering data irrelevant within minutes or even seconds of its creation. 
+For systems to react and adapt to their environment rapidly, events must be ingested and processed immediately. 
+This requires stream processing.
+
+The adoption of stream processing enables systems to move away from retrospective, scheduled computation toward prospective analysis.
+
+* *Retrospective analysis* looks backward in time to report on past events and historical trends using bounded, static datasets.
+
+* *Prospective analysis*, in contrast, is a form of data evaluation focused on the future or current state, utilizing continuous data streams to predict, forecast, or immediately react to events.
+
+The latter capability is mandatory for numerous modern applications, including financial systems (real-time fraud detection), IoT (monitoring sensor readings to react instantaneously to potential equipment malfunctions), user experience (providing user recommendations based on real-time webpage interaction data), and computer vision (analyzing continuous video feeds for immediate situational awareness).
+
+== From Batch to Micro-Batch
+In the previous chapters, we established the batch processing model using Apache Spark. 
+In this model, the system processes a static, bounded dataset (a file, a table) and terminates when the last record is processed. 
+The latency of the result is determined by the time required to process the entire dataset.
+
+To reduce latency, one might logically simply run the batch job more frequently. 
+If a daily report is insufficient, the same job could be run every hour, or every minute. 
+As the interval between jobs decreases, the system _approaches_ a state of continuous processing.
+
+This technique is known as _micro-batching_. 
+It treats an unbounded stream of data not as a continuous flow, but as a discrete sequence of small, bounded datasets (batches). 
+Typically, the system accumulates data for a defined time interval (e.g., 1 second), packages it into a batch, processes it using the standard batch engine, and then repeats the cycle.
+Batches can also be defined based on the amount of data, the number of data items, the presence of some '`flag`' in the data, or even some external trigger.
+
+image::micro-batching.png[]
+
+This model effectively bridges the gap between batch (<<ch:batch>>, <<ch:declarative>>) and continuous stream processing (<<ch:continuous-stream>>). 
+It allows developers to utilize the same data structures (e.g., RDDs and DataFrames in Spark) and algorithms used in batch processing, applied to a '`streaming`' context.
+
+However, this architecture imposes a theoretical limit on latency. 
+The system cannot process a record until the _entire_ batch has been successfully formed, regardless of whether that threshold is time, size, or a flag.
+For example, in the common case of time-based batch intervals, the system cannot process data faster than the duration of the micro-batch. 
+Furthermore, the overhead of scheduling, launching, and synchronizing tasks across the cluster for every batch becomes significant as the batch frequency (velocity) increases (e.g., when lowering the batch duration).
+While sufficient for use cases requiring latency in the order of seconds (e.g., dashboarding, log analysis), this model breaks down when millisecond-level latency is required.
+
+== Spark Streaming
+In this chapter, we examine Spark Streaming, which implements a discretized streaming model. 
+It treats a stream of data as a continuous series of small batch jobs over small time intervals.
+We will explore how it adapts the RDD abstraction to handle unbounded data through the DStream (Discretized Stream). 
+In the <<ch:continuous-stream,subsequent chapter>>, we will contrast this with native streaming (Apache Flink), which abandons the batch model entirely to achieve lower latency.
+
+Although Spark Streaming was not conceived as a streaming-first framework, it serves as an effective mechanism to introduce fundamental streaming concepts by leveraging the familiar Spark execution engine and RDD abstractions established in previous chapters. 
+This approach creates a '`bridge`' from the bounded data model to the unbounded data model.
+
+Furthermore, modern data architectures increasingly favor a _unified_ processing paradigm (as offered by frameworks like Spark and Flink), where batch and stream capabilities are integrated. 
+Understanding micro-batching is essential, as it represents one of the primary, robust forms of incremental processing used to achieve high-throughput, moderate-latency workloads within these unified systems.
+
+=== Architecture
+image::spark-streaming-architecture.png[]
+
+The architecture of Spark Streaming is based upon the principle of micro-batching, which discretizes a continuous stream into a sequence of small, bounded datasets. 
+This process involves three primary stages:
+
+. Ingestion and discretization: the system receives data from various sources (e.g., Kafka, Flume, File Systems). 
+This continuous stream of events is collected and buffered for a defined batch interval.
+Upon the expiration of this interval (e.g., every 10 seconds), the accumulated data is materialized as a standard <<sec:RDDs,RDD>>.
+
+. DStream abstraction: a Discretized Stream (DStream) is the core logical abstraction. 
+A DStream is defined as a continuous sequence of micro-batch RDDs, one for each interval. 
+The DStream represents the stream as a whole, while each underlying RDD represents a snapshot of the data generated during a single batch interval.
+
+. Processing and execution: micro-batches are processed by the exact same Spark Core Engine that handles batch jobs. 
+Consequently, the DStream API is explicitly modeled after the RDD API (e.g., `map`, `filter`, `reduceByKey`), preserving the distinction between lazy transformations (which build the execution graph) and eager operations (which trigger computation). 
+The output is produced as a new stream of resulting RDDs. 
+This design allows Spark to leverage its existing fault tolerance and optimization capabilities for stream processing.
+
+=== Performance Considerations
+Performance tuning in micro-batch processing is driven by two key points. 
+
+. Minimizing batch processing time
+The goal is to ensure that the computational time required to process each micro-batch is as low as possible. 
+This in turn enables lower latencies.
+It may certainly not be higher than the batch interval time, because otherwise processing cannot keep up with the continuous data ingestion rate.
+Reducing batch processing times focuses on the application of batch processing optimization techniques (or, the avoidance of processing bottlenecks) and the efficient use of cluster resources.
+All performance considerations from the <<ch:batch,batch model>> (minimizing shuffles, effective persistence, and data partitioning) are directly applicable and must be enforced.
+This must be complemented by assigning adequate computing resources (CPU, memory, ...) to nodes to facilitate parallel computation and in-memory operations, to further decrease batch processing times.
+
+. Determining the optimal batch interval
+The constraint for sustainable stream processing is that the batch processing time is less than the batch interval, which ensures that processing keeps pace with the continuous data ingestion rate.
+This is called the latency floor.
+In the technical sense the optimal batch interval is the latency floor. 
+Setting it lower leads to the system falling perpetually behind, resulting in systematic backlog and eventual processing failure.
+However, the latency ceiling is typically application-dependent.
+For example, if a stream feeds a dashboard that must update every second, then the batch interval should not be more than one second.
+If the application cannot handle lower latencies, then the latency ceiling is the optimal batch interval.
+If an application _does_ benefit from lower latencies, then a tuning process consisting of iteratively reducing the batch interval can be carried out to see when either the application-dependent or the technical latency floor is reached, and then selecting the largest stable interval just above that threshold.
+
+// TODO move this to generic part, before Spark Streaming
+== Windows
+In stream processing, the dataset is unbounded and continuous, presenting a challenge for most analytical functions. 
+Operations such as calculating a sum, average, or count (stateful aggregation) require a finite scope to produce a meaningful, non-infinite result.
+
+A window is the fundamental mechanism used to solve this problem by logically partitioning the unbounded data stream into finite, processable segments.
+Windows impose fixed criteria, typically time (e.g., the last 5 minutes of data) or element count (e.g., the last 100 events), that define the boundaries for an aggregation operation.
+This enables the processing engine to manage the associated intermediate state (e.g., the running sum and count for that segment). 
+Once a window is finalized, its intermediate state can be safely evicted, preventing infinite memory growth and enabling fault recovery via managed checkpointing.
+Checkpointing is the process of periodically saving a consistent snapshot of the application's state and metadata to durable, non-volatile storage, which enables the system to recover computation correctly after a failure without processing all data from the source.
+// TODO forward ref to section about this
+
+Streaming frameworks typically offer a variety of windows that you can use.
+
+image::streaming-windows.png[]
+
+* *Sliding windows* are defined by two parameters: the window size and the slide interval.
+When the slide interval is smaller than the window size, successive windows overlap, meaning a single event is included in multiple output aggregations. 
+The size constraint can be based on time, count, or data volume.
+Sliding windows are commonly used for calculating moving averages or continuous trend reports.
+For example: a 7-day window that slides every day means that one new window is processed daily and that this new window shares six days of data with the window processed the day before.
+
+* *Tumbling windows* are non-overlapping, sequential windows defined by a fixed size. 
+The moment a window closes, the next window immediately begins. 
+Consequently, every event is assigned to exactly one window. 
+Tumbling windows can be considered to be sliding windows where the slide interval is equal to the window duration. 
+
+* *Landmark windows* have boundaries defined by specific external events, content flags, or arbitrary conditions, rather than a clock or counter. 
+The window often spans the entire stream history for a specific key and is finalized only upon the occurrence of the defined '`landmark`' event.
+A typical example is letting a window coincide with a user's session, where the window closes only when an explicit logout event is received.
+
+* *Session windows* are dynamic, data-driven windows primarily used for analyzing user or entity activity. Its boundaries are determined by a heuristic known as the inactivity gap.
+The window opens upon the first event and closes only after a defined period (e.g., 30 seconds) elapses without any subsequent data arriving for that session key.
+
+=== DStream Windows
+In Spark Streaming, the underlying micro-batching architecture inherently imposes a _physical_ tumbling window that dictates how the input stream is materialized.
+
+This constraint arises because the underlying Spark execution engine is designed to operate on bounded RDDs. 
+The streaming system must be initialized with a fixed micro-batch duration (the batch interval). 
+Every time this period elapses, all data accumulated during that time is materialized as a single, discrete RDD.
+
+Crucially, because this RDD contains a snapshot of data that does not overlap with the preceding or succeeding RDD, the sequence of these materialized data units forms a series of non-overlapping, adjacent segments. 
+This sequence is, by definition, a physical tumbling window defined solely by the batch interval that is configured.
+In our example code and exercises this happens programmatically when creating the `StreamingContext`.
+
+[source,scala]
+val ssc = new StreamingContext(sc, Seconds(1))
+
+On top of this physical tumbling window, a program may define <<sec:dstream-windowing-transformations,logical, analytical windows>> to answer business questions such as "`what are the trends over the last 10 seconds?`"
+The specified batch interval of the underlying tumbling window acts as a constraint that dictates the limits of all subsequent analysis: any logical window, whether sliding or tumbling, must be constructed by the system performing a union operation over a sequential collection of these small, non-overlapping RDDs. 
+Therefore, the total length of any logical window _must_ always be a direct, _exact multiple_ of the fundamental physical batch interval.
+
+== Creating DStreams
+The primary access point for the Spark Streaming API is the `StreamingContext` object. 
+This object fulfills the role of the central coordinator, analogous to the `SparkContext` for RDDs and the `SparkSession` for DataFrames and Spark SQL. 
+DStreams are generated by invoking specific input methods on this context to establish the connection to a source data stream.
+
+[source, scala]
+def socketStream[T](hostname: String, 
+                    port: Int, converter: (InputStream) => Iterator[T],
+                    storageLevel: StorageLevel): ReceiverInputDStream[T]
+
+Creates an input DStream by connecting to an arbitrary TCP socket source defined by hostname and port.
+It is designed for handling non-standard data types (`T`). 
+Since the raw TCP input arrives as a byte stream (InputStream), a mandatory, user-defined `converter` function must be provided. 
+This function is responsible for deserializing the raw input bytes into an iterator of the desired element type (`T`) before being processed by the system. 
+The `storageLevel` dictates how the received data is maintained on the worker nodes for fault tolerance.
+
+[source, scala]
+def socketTextStream(hostname: String,
+                     port: Int): ReceiverInputDStream[String]
+
+Convenience wrapper that creates an input DStream by connecting to a standard TCP socket source. 
+It is specifically designed to read plain text data. 
+Unlike the generic `socketStream`, this method does not require a user-defined converter because it automatically assumes the input data should be delimited and decoded into a stream of `String` elements. 
+This makes it suitable for sources such as continuous log files or simple message streams.
+
+[source, scala]
+def fileStream[K, V](directory: String): InputDStream[(K, V)]
+
+// TODO textFileStream
+
+Creates an input DStream by continuously monitoring a specified directory on a Hadoop-compatible filesystem (such as HDFS, S3, or a local filesystem).
+It is designed to ingest data from new files that appear in that directory.
+This makes it suitable for data that is periodically dumped into a structured storage location. 
+The method requires generic key and value types `K` and `V` to define the expected format of the file contents.
+For example, when reading a simple plain text file, `fileStream` breaks the file into lines. 
+The generic types would be inferred as `K = Long` (the offset of the line) and `V = String` (the text of the line).
+// This structure is inherited directly from the standard Hadoop InputFormat paradigm. TODO ref
+
+[source, scala]
+def receiverStream[T](receiver: Receiver[T]): ReceiverInputDStream[T]
+
+Creates an input DStream from an arbitrary, user-defined data ingestion source. 
+It functions as a flexible extension point for the framework, allowing a developer to implement a custom class, extending `Receiver[T]`. 
+This custom receiver is responsible for establishing a connection, actively polling an ingestion endpoint, and reliably pushing the data into Spark's memory for stream processing.
+// TODO: link to exercise
+
+[source, scala]
+def queueStream[T](queue: Queue[RDD[T]], oneAtATime: Boolean = true): InputDStream[T]
+
+Creates an input DStream by receiving data from a standard Scala `Queue` of RDDs. 
+It is primarily used for deterministic testing and debugging, as it allows the developer to manually inject known data batches into the stream at controlled points, circumventing the need for an external live data source.
+
+Unlike other input methods that initiate a batch formation job based on the _duration_ of the batch interval, `queueStream` uses the batch interval as a polling mechanism.
+The `StreamingContext` periodically checks `queue` at the end of every micro-batch interval.
+The system dequeues one or more RDDs from queue, which then form the current micro-batch for processing.
+The `oneAtATime` parameter controls whether a single RDD is dequeued per check (default) or if all available RDDs are combined into the current micro-batch RDD.
+The explicit enqueue operations in a program, rather than the system clock, determines when new data becomes available to the DStream.
+We will rely on this method in our examples and most exercises.
+// TODO check qualifier 'most' when exercises are stable
+
+== DStream Transformations
+Transformations are lazy operations applied to a DStream that return a new DStream.
+Like in the RDD world, they define a computation graph, which is applied to each underlying RDD that is generated in every micro-batch interval.
+
+There are two types of transformations: stateless and stateful transformations.
+The stateful transformations can be further subdivided into non-windowing and windowing transformations based on their state.
+Stateless transformations only depend on the current micro-batch RDD, while stateful transformations also depend on previous RDDs.
+Windowing state is temporary and tied to a time-slice, while '`non-windowing`' state is persistent (maintained for the entire duration of the stream) and tied to a key.
+
+=== Stateless Transformations
+Stateless transformations apply independently to each micro-batch.
+Each batch is processed separately and the output does not depend on what happened in some previous batch.
+Stateless transformations include some of the transformations available for RDDs (e.g. `filter`, `map`, `flatMap`, `persist`) and Pair RDDs (e.g., `groupByKey`, `reduceByKey`, `mapValues`, `join`).
+
+[[exa:dstream-word-count-stateless]]
+====
+The code below demonstrates a stateless word count using the `reduceByKey` transformation. 
+As a stateless operation, the computation is applied independently to the RDD generated in each micro-batch. 
+Consequently, the output for any given word represents only its count within that specific batch, yielding a subresult rather than a running total across the entire stream history.
+
+[source, scala]
+----
+val ssc = new StreamingContext(sc, Seconds(1))
+
+val rddQueue = new Queue[RDD[String]]()
+
+val lines: DStream[String] = ssc.queueStream(rddQueue)
+
+val wordCounts: DStream[(String, Int)] = lines
+                    .flatMap(_.split(" "))
+                    .map(word => (word, 1))
+                    .reduceByKey(_ + _)
+
+wordCounts.print()                     
+
+ssc.start()
+
+println("--- micro-batch 1 ---")
+rddQueue.enqueue(sc.parallelize(Seq("hello spark", "hello world")))
+Thread.sleep(2000)
+// -------------------------------------------
+// Time: 1763216401000 ms
+// -------------------------------------------
+// (hello,2)
+// (world,1)
+// (spark,1)
+// -------------------------------------------
+// Time: 1763216402000 ms
+// -------------------------------------------
+
+println("--- micro-batch 2 ---")
+rddQueue.enqueue(sc.parallelize(Seq("spark streaming", "hello spark")))
+Thread.sleep(2000)
+// --- micro-batch 2 ---
+// -------------------------------------------
+// Time: 1763216403000 ms
+// -------------------------------------------
+// (hello,1)
+// (spark,2)
+// (streaming,1)
+----
+
+====
+
+[source, scala]
+def transform[U](transformFunc: (RDD[T]) => RDD[U]): DStream[U]
+
+Returns a new DStream in which each RDD is generated by applying an arbitrary RDD-to-RDD function `transformFunc` on each RDD of this DStream.
+
+It is a '`power-user`' operation that gives you direct access to the underlying RDD of each micro-batch. 
+Its purpose is to let you apply any arbitrary RDD-to-RDD operation that isn't directly exposed by the DStream API.
+One typical use case for using `transform` is <<exa:dstream-join-rdd,enrichment>>.
+<<exa:dstream-transform, Another example>> of using `transform` is shown below.
+
+[[exa:dstream-transform]]
+====
+Imagine that we want to perform word counting, but have a huge blacklist of words (represented as an RDD for this reason) that we do not want to be counted.
+Using RDDs, we could use `subtractByKey` to eliminate blacklisted words from word pair.
+However, DStream does not have a `subtractByKey` transformation.
+The program below therefore uses `transform` with a function that takes the current batch RDD of word pairs and applies the RDD-level `subtractByKey` operation to eliminate blacklisted words.
+This effectively '`anti-joins`' the DStream with a static, non-streaming RDD `blacklist` to filter out certain words. 
+
+[source, scala]
+----
+val hugeBlacklistWords = Seq("the", "a", "an", "is", "in", "of")
+val blacklist: RDD[(String, Unit)] = sc
+    .parallelize(hugeBlacklistWords)
+    .map(word => (word, ()))
+    .persist() // !
+
+val rddQueue = new Queue[RDD[String]]()
+val lines: DStream[String] = ssc.queueStream(rddQueue)
+val wordPairs: DStream[(String, Int)] = lines
+    .flatMap(_.split(" "))
+    .map(word => (word.toLowerCase, 1))
+val filteredPairs: DStream[(String, Int)] = wordPairs
+    .transform { _.subtractByKey(blacklist) }
+val wordCounts: DStream[(String, Int)] = filteredPairs
+    .reduceByKey(_ + _)
+wordCounts.print()
+
+ssc.start()
+
+rddQueue.enqueue(sc.parallelize(Seq("hello world", "the dog is a good dog")))
+// (hello,1)
+// (world,1)
+// (dog,2)
+// (good,1)
+
+rddQueue.enqueue(sc.parallelize(Seq("hello spark", "a new world of spark")))
+// (hello,1)
+// (world,1)
+// (spark,2)
+// (new,1)
+----
+====
+
+<<exa:logistic-regression>> in <<ch:batch>> illustrated that persisting is useful in iterative algorithms.
+While code using DStreams maybe does not have an explicit loop in the code, there is an implicit loop resulting in iterative use of RDDs. 
+Therefore, in <<exa:dstream-transform>> it is important to `persist` `blacklist` because it is used in every `transform` of a micro-batch.
+
+==== Transformations that are actions on RDDs
+Operations that are terminal actions on an RDD or Pair RDD, aggregating the RDD into a single value or map, are repurposed as stateless _transformations_ on a DStream.
+They (lazily) return a new DStream where each RDD contains the result of that action.
+
+The following are some examples of such commonly used transformations.
+
+[source, scala]
+def count(): DStream[Long]
+def reduce(reduceFunc: (T, T) => T): DStream[T]
+def reduceByKey(reduceFunc: (V, V) => V): DStream[(K, V)]
+
+For example, `count` returns a new DStream in which each RDD has a single element generated by counting
+each RDD of this DStream.
+Transformations like `reduceByKey` that correspond to actions requiring a Pair RDD, are likewise only available on Pair DStreams.
+
+[[exa:dstream-transformation-rdd-action]]
+====
+Operation `reduce` is an action on RDDs, and therefore eagerly executed.
+However, the DStream below results in an error because both `map` _and_ `reduce` are _not_ eagerly executed on DStreams.
+
+[source, scala]
+----
+val wordLength: DStream[Int] = words.map(_.length).reduce(_ + _)
+----
+
+The following error will be thrown:
+
+    ERROR StreamingContext: Error starting the context, marking it as stopped
+    java.lang.IllegalArgumentException: requirement failed: No output operations registered, so nothing to execute
+
+An eager <<sec:dstream-output-operations, output operation>> is required for the DStream to actually produce a result.
+====
+
+==== Broadcast Variables
+Stateless transformations like `filter` are executed for every micro-batch.
+Therefore, if you filter based on some value not being present in a Scala list that is on the _master node_, then this list will be sent over the network to every worker node each time `filter` is applier.
+This is true for every Scala object on the master node that is used in operations.
+
+[[exa:dstream-no-broadcast]]
+====
+The following example again is about word counting with a blacklist.
+Suppose the blacklist is stored in Scala sequence `blacklistWords`, as shown below.
+Then this sequence is shipped to each worker node each time `filter` is applied.
+
+[source, scala]
+----
+val blacklistWords: Seq[String] = Seq("the", "a", "an", "is", "in", "of")
+val rddQueue = new Queue[RDD[String]]()
+val words: DStream[String] = ssc.queueStream(rddQueue).flatMap(_.split(" "))
+val filteredWords: DStream[String] = words.filter(word => !blacklistWords.contains(word.toLowerCase))
+val wordPairs: DStream[(String, Int)] = filteredWords.map((_, 1))
+val wordCounts: DStream[(String, Int)] = wordPairs.reduceByKey(_ + _)
+wordCounts.print()
+----
+====
+
+This optimization is achieved through the `Broadcast` utility, which serializes a large, read-only Scala object (e.g., a lookup table, a set of rules, or a machine learning model) and transfers it to all worker nodes `prior` to the stream computation. 
+This amortizes the network cost by paying the price once, ensuring the data is cached locally on each executor for repetitive, low-latency access across subsequent micro-batch cycles.
+
+[source, scala]
+def broadcast[T](value: T): Broadcast[T]
+
+Broadcasts a read-only variable to the cluster, returning a `Broadcast` object for reading it in distributed functions.
+The `broadcast` operation is not a transformation itself, but is meant to be used inside DStream transformations.
+
+[[exa:dstream-broadcast]]
+====
+This example revisits the stateless word count, now using `filter` with a blacklist and applying `broadcast` to optimize the exclusion process.
+
+[source, scala]
+----
+val blacklistWords: Broadcast[Seq[String]] = sc.broadcast(Seq("the", "a", "an", "is", "in", "of"))
+val rddQueue = new Queue[RDD[String]]()
+val words: DStream[String] = ssc.queueStream(rddQueue).flatMap(_.split(" "))
+val filteredWords: DStream[String] = words.filter(word => !blacklistWords.value.contains(word.toLowerCase))
+val wordPairs: DStream[(String, Int)] = filteredWords.map((_, 1))
+val wordCounts: DStream[(String, Int)] = wordPairs.reduceByKey(_ + _)
+wordCounts.print()
+----
+====
+
+Broadcasting is a general Spark optimization, not exclusive to DStreams. 
+While its necessity is often immediately visible in standard RDD programs that use _explicit_ iterative loops, the need for caching large objects in DStreams is implicit. 
+The continuous nature of the micro-batch scheduler means the computation is repeatedly executed, incurring the same network overhead, even though the iterative logic is hidden within the DStream execution graph. Therefore, applying the `Broadcast` mechanism is a fundamental optimization technique relevant across all Spark APIs.
+
+=== Stateful DStream Transformations
+Stateful transformations are those that explicitly persist and manage intermediate results across discrete micro-batch boundaries.
+
+These operations are essential because they provide the necessary context for analyzing the stream's history. 
+Unlike stateless transformations, which operate only on the data within the current micro-batch, stateful transformations also use data from past batches to compute the current output. 
+This capability is required for complex stream analytics, including tracking running totals, maintaining session continuity, or detecting long-term temporal patterns. 
+By definition, all such stateful operations are inter-batch and require the streaming framework to employ robust mechanisms to ensure fault tolerance and data consistency for the accumulated state.
+
+We distinguish between two types of stateful transformations: <<sec:dstream-non-windowing-transformations,non-windowing>> and <<sec:dstream-windowing-transformations,windowing>>.
+Some stateful transformations require <<sec:dstream-checkpointing,checkpointing>> for fault-tolerance.
+
+[[sec:dstream-non-windowing-transformations]]
+==== Non-windowing Stateful DStream Transformations
+Non-windowing stateful operations are characterized by maintaining state per-key across the entire, unbounded history of the stream, updating with each subsequent micro-batch.
+This mechanism is essential for calculating metrics that require an all-time total or continuous tracking, such as running totals or persistent session counters.
+
+The state inherently key-bound, for example tied to a unique user or sensor ID. 
+Once initialized for a specific key, the state is continuously updated with new data from every incoming micro-batch for the entire duration of the streaming application. 
+The term '`non-windowing`' signifies that the state is not scoped to a window: it is never automatically discarded by a time or count boundary. 
+
+A typical non-windowing transformation is `updateStateByKey`
+// TODO others?
+
+// TODO this should become `mapWithState`
+[source, scala]
+def updateStateByKey[S](updateFunc: (Seq[V], Option[S]) => Option[S]): DStream[(K, S)]
+
+It returns a new '`state`' DStream where the state for each key is updated by applying the given function on the previous state of the key and the new values of each key.
+
+[[exa:dstream-updatestatebykey]]
+====
+The following code implements a stateful running word count using `updateStateByKey`.
+It counts the total occurrences of each word across all micro-batches processed since the stream started.
+
+`updateStateByKey` is the core stateful (inter-batch) transformation.
+It '`connects`' the `wordPairs` DStream to the `updateFunction`.
+For each micro-batch, it takes the `(word, 1)` pairs, groups them by key, and invokes `updateFunction` for each word.
+The resulting `runningWordCounts` DStream contains the updated total counts after processing each batch.
+
+Function `updateFunction` defines the logic for how to update the state for a single word when new data arrives.
+It is called by `updateStateByKey` for every word present in the current micro-batch.
+For example, in the first micro-batch the word `"dog"` appears twice, meaning that the word pair `("dog", 1)` will be generated twice.
+When updating the state for this batch, `updateFunction` will therefore receive `Seq(1, 1)` as values for key `"dog"`, with `None` as `runningCount` since this is the first appearance of this word in the stream.
+
+`runningCount.sum`` is a concise way to handle the `Option`. 
+If `runningCount` is `Some(5)` for example, `.sum` returns `5`.
+If it is `None`, as is the case for key `"dog"` when processing the first batch, `.sum` returns `0`.
+
+`newValues.size` counts how many times the word appeared in the current batch (`2` for `"dog"` in the first batch).
+
+[source, scala]
+----
+ssc.checkpoint("checkpointDir")
+
+def updateFunction(newValues: Seq[Int], runningCount: Option[Int]): Option[Int] = {
+        Option(runningCount.sum + newValues.size)
+}
+
+val rddQueue = new Queue[RDD[String]]()
+val lines: DStream[String] = ssc.queueStream(rddQueue)
+val wordPairs: DStream[(String, Int)] = lines
+    .flatMap(_.split(" "))
+    .map(word => (word.toLowerCase, 1))
+val runningWordCounts: DStream[(String, Int)] = wordPairs.updateStateByKey[Int](updateFunction _)
+
+runningWordCounts.print()
+
+ssc.start()
+
+rddQueue.enqueue(sc.parallelize(Seq("hello world", "dog eat dog")))
+// (eat,1)
+// (hello,1)
+// (world,1)
+// (dog,2)
+
+rddQueue.enqueue(sc.parallelize(Seq("hello spark", "new world")))
+// (eat,1)
+// (hello,2)
+// (world,2)
+// (dog,2)
+// (spark,1)
+// (new,1)
+----
+====
+
+
+[[sec:dstream-windowing-transformations]]
+==== Windowing DStream Transformations
+Windowing transformations enable the aggregation of data across multiple consecutive micro-batches, effectively creating a logical time window that spans a longer duration than the physical batch interval.
+Unlike the stateless and per-key stateful transformations discussed previously, windowing operations have no direct equivalent in the standard RDD API.
+
+While the physical batch interval dictates the frequency of RDD materialization, windowing allows you to look back over a sequence of these materialized RDDs to answer questions about the recent past. Consequently, the duration of a window must always be an exact multiple of the batch interval (i.e., it must be equal or strictly larger than the micro-batch duration).
+
+State management in windowing transformations differs significantly from non-windowing stateful operations like `updateStateByKey`.
+
+. The state is *bounded*: windowing aggregates events only within the finite '`slice`' of time defined by the window parameters.
+
+. The state is *ephemeral*: it is initialized when a window opens, updated as new batches arrive, finalized when the window closes, and automatically evicted (garbage collected) immediately thereafter.
+It does not persist indefinitely.
+
+`window` is the most general-purpose and fundamental windowing transformation. 
+It most clearly illustrates the concept of windowing.
+
+[source, scala]
+window(windowDuration: Duration, slideDuration: Duration): DStream[T]
+
+The `window` transformation is a fundamental structural operation that groups RDDs from multiple sequential micro-batches into a new DStream of larger, logical windowed RDDs.
+
+The window transformation is defined by two primary parameters, both of which are constrained by the physical batch interval:
+
+. `windowDuration` defines the total length of the time segment to be aggregated.
+It must be a multiple of the DStream's fixed micro-batch interval, as a window cannot structurally start or end mid-batch.
+
+. `slideDuration` defines the frequency at which the new windowed RDD is generated.
+It must also be a multiple of the micro-batch interval.
+
+The relationship between these two parameters determines the window's analytical nature.
+
+* A tumbling windows results when `windowDuration` is equal to `slideDuration`. 
+The resulting windows are sequential and non-overlapping. 
+If both parameters are set equal to the micro-batch interval, the output effectively regenerates the original stream of RDDs.
+
+* A sliding window results when `slideDuration` is less than `windowDuration`.
+The resulting windows overlap, meaning a single event contributes to multiple successive aggregations. 
+For example, setting both the batch interval and `slideDuration` to 10 seconds and setting  `windowDuration` to 5 minutes, means a 5-minute average is recalculated every 10 seconds.
+This effectively generates 6 new, highly overlapping windows per minute, with every single micro-batch being included in 30 different, overlapping windows after the application has been running for 5 minutes.
+
+[[exa:dstream-window]]
+====
+The example below creates a sliding window over a DStream, followed by an intra-batch aggregation.
+This approach explicitly creates a windowed DStream representing the union of RDDs from the specified duration.
+The configuration defines a window duration of 3 seconds and a slide duration of 1 second. 
+With a batch interval of 1 second, the system performs a `reduceByKey` operation every second on a dataset composed of the three most recent batches. 
+
+The execution trace demonstrates the window progression.
+Initially, the window fills, accumulating counts from incoming batches.
+Once the window is full (third batch), each new computation includes the newest batch and evicts the batch that arrived three intervals prior.
+As the stream ends, the remaining data slides out of the window until the result is empty.
+
+[source, scala]
+----
+…
+val windowedWordCounts: DStream[(String, Int)] = wordPairs
+                                .window(Seconds(3), Seconds(1))
+                                .reduceByKey(_ + _)
+
+windowedWordCounts.print()
+ssc.start()
+
+rddQueue.enqueue(sc.parallelize(Seq("one", "two", "three")))
+// (two,1)
+// (one,1
+// (three,1)
+
+rddQueue.enqueue(sc.parallelize(Seq("two", "three", "four")))
+// (two,2)
+// (one,1)
+// (four,1)
+// (three,2)
+
+rddQueue.enqueue(sc.parallelize(Seq("three", "four", "five")))
+// (two,2)
+// (one,1)
+// (four,2)
+// (five,1)
+// (three,3)
+
+rddQueue.enqueue(sc.parallelize(Seq("four", "five", "six")))
+// (two,1)
+// (six,1)
+// (four,3)
+// (five,2)
+// (three,2)
+
+// (six,1)
+// (four,2)
+// (five,2)
+// (three,1)
+    
+// (six,1)
+// (four,1)
+// (five,1)
+
+// ()
+----
+====
+
+[source, scala]
+def groupByKeyAndWindow(windowDuration: Duration, slideDuration: Duration): DStream[(K, Seq[V])]
+
+This transformation applies `groupByKey` over a sliding window of data. 
+It returns a new DStream of (K, Seq[V]) pairs, where the sequence contains all values for a specific key across the specified `windowDuration`.
+
+Functionally, this operation is equivalent to applying the `window` transformation followed by the `groupByKey` transformation: `stream.window(windowDuration, slideDuration).groupByKey()`.
+
+[[exa:dstream-groupbykeyandwindow]]
+====
+The following code, using `groupByKeyAndWindow`, produces the same windowed output stream as in <<exa:dstream-window>>.
+[source, scala]
+----
+…
+val windowedWordCounts: DStream[(String, Int)] = pairs
+                                    .groupByKeyAndWindow(Seconds(3), Seconds(1))
+                                    .mapValues(_.reduce(_ + _))
+----
+====
+
+`groupByKeyAndWindow` is highly inefficient as it shuffles all data from the entire window for _every_ slide interval.
+The combination of two operations (windowing and grouping) does not offer any optimization advantages in this case. 
+It is the streaming equivalent of the equally inefficient RDD pattern `rdd.groupByKey().mapValues(...)`.
+Therefore, `dstream.window(...).groupByKey(...)` and `dstream.groupByKeyAndWindow(...)` are considered anti-patterns, and `dstream.reduceByKeyAndWindow(...)` should be used for windowed aggregations instead.
+
+// TODO: explain when this *is* needed (non-associative aggregations)
+
+[source, scala]
+----
+def reduceByKeyAndWindow(reduceFunc: (V, V) => V, 
+    windowDuration: Duration, slideDuration: Duration): DStream[K, V]
+def reduceByKeyAndWindow(reduceFunc: (V, V) => V, invReduceFunc: (V, V) => V, 
+    windowDuration: Duration, slideDuration: Duration): DStream[K, V]
+----
+
+Return a new DStream by applying `reduceByKey` over a sliding window.
+When computing sliding window aggregates, events are aggregated locally before shuffling them (i.e., map-side combine), making this operation much more efficient than `groupByKeyAndWindow` (for performing reductions).
+When specifying `invReduceFunc`, `reduceByKeyAndWindow` applies an _incremental_ `reduceByKey` over a sliding window.
+This is more efficient than the first form as it enables Spark to subtract the elements that '`leave`' the window.
+
+However, it is applicable only to _invertible_ reduce functions.
+Incremental `reduceByKeyAndWindow` is very useful when overlap between windows is very large. 
+For example, each time `reduceByKeyAndWindow` produces a new output window, and `windowDuration` is 4 hours and `slideDuration` 30 seconds, the operation only removes the first 30 seconds and adds the last 30 second of data, reusing 3 hours and 59 minutes of data that overlaps between the previous and the new window.
+
+====
+[source, scala]
+----
+…
+val windowedWordCounts: DStream[(String, Int)] = wordPairs
+                                                    .reduceByKeyAndWindow(_ + _, _ - _,
+                                                           Seconds(3), Seconds(1))
+
+windowedWordCounts.print()
+
+ssc.start()
+
+rddQueue.enqueue(sc.parallelize(Seq("one", "two", "three")))
+// (two,1)
+// (one,1)
+// (three,1)
+
+rddQueue.enqueue(sc.parallelize(Seq("two", "three", "four")))
+// (two,2)
+// (one,1)
+// (four,1)
+// (three,2)
+
+rddQueue.enqueue(sc.parallelize(Seq("three", "four", "five")))
+// (two,2)
+// (one,1)
+// (four,2)
+// (five,1)
+// (three,3)
+
+rddQueue.enqueue(sc.parallelize(Seq("four", "five", "six")))
+// (two,1)
+// (six,1)
+// (one,0)
+// (four,3)
+// (five,2)
+// (three,2)
+
+// (two,0)
+// (six,1)
+// (one,0)
+// (four,2)
+// (five,2)
+// (three,1)
+
+// (two,0)
+// (six,1)
+// (one,0)
+// (four,1)
+// (five,1)
+// (three,0)
+
+// (two,0)
+// (six,0)
+// (one,0)
+// (four,0)
+// (five,0)
+// (three,0)
+
+// (two,0)
+// (six,0)
+// (one,0)
+// (four,0)
+// (five,0)
+// (three,0)
+
+// (two,0)
+// (six,0)
+// (one,0)
+// (four,0)
+// (five,0)
+// (three,0)
+
+----
+
+// Checkpointing needed: reduceByKeyAndWindow with inverse reduction maintains state (which is iuncrementally updated) across batches.
+====
+
+So far we have discussed operations on Pairs.
+Below we list a number of windowed transformations available for all types of values.
+These transformations also combine an operation with a windowing 
+Spark is able to optimize these using the same optimization tricks as discussed above.
+
+[source, scala]
+def countByWindow(windowDuration: Duration, slideDuration: Duration): DStream[Long]
+
+Return a new DStream in which each RDD has a single element generated by counting the number of elements in a sliding window over this DStream.
+Optimization possible: subtract elements leaving window, add new ones.
+
+[source, scala]
+def reduceByWindow(reduceFunc: (T, T) => T, windowDuration: Duration, slideDuration: Duration): DStream[T]
+
+Return a new DStream in which each RDD has a single element generated by reducing all elements in a sliding window over this DStream.
+Also available with inverse reduce function.
+
+[source, scala]
+def countByValueAndWindow(windowDuration: Duration, slideDuration: Duration): DStream[(T, Long)]
+
+Return a new DStream in which each RDD contains the count of distinct elements in RDDs in a sliding window over this DStream.
+
+[[exa:dstream-countbyvalueandwindow]]
+====
+The following code, using `countByValueAndWindow`, produces the same windowed output stream as in <<exa:dstream-window>> and <<exa:dstream-groupbykeyandwindow>>.
+
+[source, scala]
+----
+…
+val words: DStream[String] = lines.flatMap(_.toLowerCase.split(" "))
+val runningWordCounts: DStream[(String, Long)] = words.countByValueAndWindow(Seconds(3), Seconds(1))
+----
+====
+
+// ^^ <checkpointing required>
+
+[[sec:dstream-checkpointing]]
+==== Fault Tolerance and Checkpointing for Stateful Operations
+In regular Spark batch processing, fault tolerance is primarily managed through <<sec:lineage,lineage>>: if an RDD (partition) is lost, the system recomputes the result by re-reading the immutable source data from a reliable filesystem. 
+This model is insufficient in streaming because streaming sources may not provide replayable input. 
+Sources like a TCP socket or receiver-based streams produce ephemeral data that cannot be re-read if lost, defeating lineage-based recovery.
+
+For stateless operations (where the output does not depend on past batches), this does not matter as the resulting output is simply discarded if the system fails.
+When the system recovers, computation can restart from the moment new data arrives, as there is no reliance on past data for computing results (although this implies data loss).
+// TODO: restructure for clarity: does not matter for stateless, and for stateful that do not maintain state
+
+However, things are different when stateful operations are used that must maintain state between batches, i.e., a '`running`' state that requires updating an arbitrary state object based on new data.
+The two primary examples of such state are the key-value maps holding accumulated results from `updateStateByKey`, and the incremental state of `reduceByKeyAndWindow` when used with inverse reduction.
+In this case, when the system fails, it cannot just continue the computation because the required state is lost.
+Although the running state could be recovered if a streaming source provides replayable input, it would incur a massive cost of recomputing the entire stream's history; it could mean re-executing days of computational work simply to recover a single key-value map.
+
+Most other stateful operations do not _maintain_ state across batches
+// For example, `reduceByKey` is not stateful, even when applied on a windowed stream.
+`window` itself is a stateful transformation by definition because it depends on more than the current batch, but it does not maintain a running state between batches.
+`reduceByKey` recomputes from scratch for each collection of RDDs in each window, and therefore also does not maintain a running state.
+Similarly, `reduceByKeyAndWindow` is stateful, but does not maintain a running state if an inverse reduce function is _not_ provided.
+
+Stateful operations that do maintain a running state across batches must employ an explicit recovery mechanism for this state in case of failure.
+This is called checkpointing.
+Checkpointing is the process of periodically saving a consistent snapshot of the application's meta-data and state to durable storage. 
+
+[source,scala]
+def checkpoint(directory: String): Unit
+
+The `checkpoint` method instructs the system to periodically save application meta-data and the running state maintained across batches. 
+If the streaming application crashes, it can be restarted and will automatically reload this persistent state, ensuring the calculation resumes exactly where it left off without losing state computed from past batches.
+
+The decision of when to checkpoint is time-based and orchestrated by the `StreamingContext` in the driver program.
+Checkpointing is executed periodically at a configurable time interval, known as the checkpoint interval. This interval can be specified by the developer, but Spark will use a multiple of the micro-batch duration as default to ensure consistency.
+
+When the checkpoint interval expires, the system persists two distinct sets of data to the durable storage:
+
+. Metadata: including the DStream graph (the logical flow of transformations), the definitions of the windowing operations, and the IDs of the RDDs that are part of the current processing. 
+This is necessary for recovery of the computation if the driver fails or is restarted, and therefore offers '`driver-level fault-tolerance`'.
+This type of fault-tolerance is useful, whether the stream computation is stateful or not.
+
+. State: the actual internal application state that is updated incrementally.
+This is necessary for resuming a stateful computation without data loss.
+
+Although not suitable for recovering the complete state of a stateful computation, the mechanism of lineage-based fault-tolerance is always active at the level of processing individual batches, independent of whether stateless or stateful transformations are involved, and whether checkpointing is used or not.
+When data from a non-replayable source like a socket is still in memory (because it was not yet completely processed), then lineage can still recover intermediate RDDs while processing a batch RDD. 
+When this memory is lost before processing completes because a driver or executor node crashes, then this input data cannot be recovered and lineage-based recovery cannot be used.
+When data from a non-replayable source is explicitly stored in a '`write-ahead log`' before being processed, then lineage-based recovery works even in the presence of node failures.
+
+Even when lineage-based recovery is possible, checkpointing can still be helpful (and sometimes necessary) when the lineage becomes very long.
+While stateless transformations have lineage local to a batch, stateful operations link RDDs across batches, causing large or even unbounded lineage growth.
+Huge lineage DAGs lead to much overhead and slow recovery.
+Checkpointing breaks this cross-batch lineage by saving the data to disk and treating the recovered RDD as a fresh source with no lineage dependencies.
+
+=== DStream Joining
+Join operations play an important role in any data processing framework and are also defined for Pair DStreams.
+
+[source, scala]
+def join[W](other: DStream[(K, W)]): DStream[(K, (V, W))]
+
+The standard `join` operation joins RDDs that are generated in the _same_ micro-batch interval. 
+An element from batch n in the first stream can only be joined with an element from batch n in the second stream. 
+`join` is a stateless (i.e., intra-batch) operation and it has no '`memory`' of past batches and does not look forward or backward in time.
+While `join` itself is not a windowing operation, it can be applied to DStreams that have been windowed.
+
+[[exa:dstream-join]]
+====
+Imagine you are an analyst for an e-commerce platform.
+Your goal is to gain immediate business insights by connecting a user's purchase to specific ads they clicked.
+
+You have two streams available:
+
+. `purchases: DStream[(Int, String)]`
+. `clicks: DStream[(Int, String)]`
+
+The most direct way to connect these two events is to join the streams by their common user id key. 
+
+[source, scala]
+----
+val purchaseQueue = new Queue[RDD[(Int, String)]]()
+val clickQueue = new Queue[RDD[(Int, String)]]()    
+
+val purchases: DStream[(Int, String)] = ssc.queueStream(purchaseQueue)
+val clicks: DStream[(Int, String)] = ssc.queueStream(clickQueue)
+val joined = purchases.join(clicks)
+
+joined.print()
+
+ssc.start()
+
+purchaseQueue.enqueue(sc.parallelize(Seq((101, "lamp"))))
+clickQueue.enqueue(sc.parallelize(Seq((101, "ad235"), (102, "ad38"), (101, "ad47"))))
+// (101,(lamp,ad235))
+// (101,(lamp,ad47))
+
+purchaseQueue.enqueue(sc.parallelize(Seq((102, "desk"))))
+clickQueue.enqueue(sc.emptyRDD)
+// ()
+----
+
+Both purchases and clicks are not windowed, so they generate a batch at the same intervals, and so the joined output follows the same batch interval.
+
+As evident from the output, this stateless join does _not_ solve the business problem: user `102` clicked on `"ad38"` in the first batch, but the purchase of a `"desk"` was registered in the second batch.
+====
+
+<<exa:dstream-join>> demonstrates that a stateless join on non-windowed streams is often insufficient, as it fails to connect matching events that arrive in different micro-batches.
+
+To solve this type of problem, a _stateful_ join is required.
+This allows events from one stream to be buffered while they await a matching event from the other.
+This stateful buffering can be implemented by applying an explicit windowing transformation (e.g., `window`) to one or both streams before the `join`, or by using more complex, non-windowed stateful operations (e.g., `updateStateByKey`) to manually manage the state of un-joined events.
+
+[[exa:dstream-join-stateful]]
+====
+The most direct method to solve the business problen of <<exa:dstream-join>> is to apply an explicit windowing transformation on the `clicks` stream.
+This stream represents the history or '`state`' needed for attribution. 
+
+Say we want to match every purchase with clicks from the past 5 seconds, `window(Seconds(5))` must be applied to `clicks`.
+This ensures these events are persisted in memory for the required duration, allowing them to wait for a corresponding purchase event.
+
+The `purchases` stream represents the instantaneous event that triggers the analysis. 
+Because it matches the batch interval, the event is ensured to exists in the system for only one `join` operation.
+The code below implements this solution. 
+
+[source, scala]
+----
+…
+val ssc = new StreamingContext(sc, Seconds(1))
+…
+val purchases: DStream[(Int, String)] = ssc.queueStream(purchaseQueue)
+val clicks: DStream[(Int, String)] = ssc.queueStream(clickQueue)
+
+val windowedClicks = clicks.window(Seconds(5))
+val joined = purchases.join(windowedClicks)
+    
+joined.print()
+
+ssc.start()
+
+purchaseQueue.enqueue(sc.parallelize(Seq((101, "lamp"))))
+clickQueue.enqueue(sc.parallelize(Seq((101, "ad235"), (102, "ad38"), (101, "ad47"))))
+// (101,(lamp,ad235))
+// (101,(lamp,ad47))
+
+purchaseQueue.enqueue(sc.parallelize(Seq((102, "desk"))))
+clickQueue.enqueue(sc.emptyRDD)
+// (102,(desk,ad38))
+
+// () 
+----
+
+The resulting `joined` stream emits a batch every second, since the default slide interval is equals to the batch interval.
+====
+
+Instead of joining two DStreams, it is also possible to join a regular (i.e., non-streaming) RDD with a DStream. 
+This is essential for enriching incoming stream data with persistent metadata (e.g., user profiles, product catalogs, or configuration parameters).
+This operation relies on the `transform` operation, which provides access to the underlying Pair RDD of each micro-batch, enabling the execution of the regular Pair RDD `join` operation between the ephemeral batch and the persistent RDD. 
+This process effectively allows a large, static lookup table to be joined against every sequential micro-batch generated by the DStream. 
+The static RDD should generally be explicitly persisted to memory or disk to avoid redundant loading or recomputation in every batch cycle.
+
+[[exa:dstream-join-rdd]]
+====
+In the example code below, `rawPurchases` contains a stream of transaction IDs and purchase amounts. 
+The `users` RDD acts as a (persisted) static lookup table containing user profiles `(Name, Country)`. 
+The `enrichedPurchases` is a stream of fully enriched transaction records created by joining each batch of the `rawPurchases` stream with the `users` RDD.
+
+[source, scala]
+----
+case class User(name: String, country: String) 
+case class Purchase(amount: Double)
+
+val usersList = Seq(
+    (101, User("Alice", "BE")),
+    (102, User("Bob", "FR")),
+    (103, User("Charlie", "UK"))
+    )
+val users: RDD[(Int, User)] = sc.parallelize(usersList).persist()
+
+val purchaseQueue = new Queue[RDD[(Int, Purchase)]]()
+val rawPurchases: DStream[(Int, Purchase)] = ssc.queueStream(purchaseQueue)
+val enrichedPurchases: DStream[(Int, (Purchase, User))] = rawPurchases.transform(_.join(users))
+
+enrichedPurchases.print()
+
+ssc.start()
+
+purchaseQueue.enqueue(sc.parallelize(Seq((101, Purchase(50.0)))))
+// (101,(Purchase(50.0),User(Alice,BE)))
+
+purchaseQueue.enqueue(sc.parallelize(Seq((102, Purchase(120.0)))))
+// (102,(Purchase(120.0),User(Bob,FR)))
+
+// () 
+----
+====
+
+=== Persistence
+The `persist` and `cache` transformations control the distributed, in-memory storage level of the RDDs underlying the DStream. 
+
+[source,scala]
+def persist(): DStream[T]
+def persist(level: StorageLevel): DStream[T]
+
+The primary application of persistence in DStreams mirrors that of regular RDDs: faster fault recovery and avoidance of redundant recomputation when a DStream is consumed by multiple subsequent transformations (i.e., a fan-out in the computation graph).
+Remember that the DStream graph is a template.
+Every batch interval, the engine instantiates this template into a concrete DAG of RDDs for that specific micro-batch.
+Even when the lineage is contained strictly within that micro-batch because only stateless transformations are used, during the processing of that batch the RDD graph can still branch if you define multiple output operations (actions).
+
+The default storage level is `MEMORY_ONLY_SER`.
+
+Some complex stateful operations are implicitly persisted.
+
+* `reduceByWindow` and `reduceByKeyAndWindow` are windowing operations that combine reduction and windowing operations to be able to optimize by reusing subresults, as explained earlier.
+This happens by materializing (i.e., persisting) subresults to not recompute everything from scratch.
+
+* `updateStateByKey` is a state-based operation that maintains a persisted key-value map in order to accumulate over more than one window. 
+
+// TODO: example?
+
+[[sec:dstream-output-operations]]
+== DStream Output Operations
+Output operations serve as the trigger for the entire lazy streaming computation. 
+Analogous to actions on RDDs, they instruct the `StreamingContext` to initiate and continuously execute the DStream graph across every micro-batch interval.
+
+The function of output operations is to push the final, processed RDD from each micro-batch out to an external sink (e.g., a database, a file system, or the console). 
+Unlike RDD actions, which run once and return a result to the driver, DStream output operations run continuously on the RDD of every subsequent micro-batch until the streaming context is explicitly halted.
+
+<<exa:dstream-transformation-rdd-action>> demonstrates that a DStream cannot start computing when no output operations are specified.
+
+Some common DStream output operations are the following.
+
+[source, scala]
+def print(num: Int): Unit
+
+Prints the first `num` elements (default 10) of each micro-batch RDD to the console of the driver node. 
+This is primarily used for testing and debugging, but not for running real streaming applications.
+
+[source, scala]
+def saveAsTextFiles(prefix, [suffix])
+def saveAsObjectFiles(prefix, [suffix])
+
+Saves the contents of each micro-batch RDD as text/serialized Java object files.
+A new directory is created for each batch (e.g., prefix-timestamp), containing multiple part-files (one per RDD partition).
+
+[source, scala]
+def foreachRDD(foreachFunc: (RDD[T]) => Unit): Unit
+
+This operation is the most powerful and flexible output operator in Spark Streaming. 
+It applies the user-defined `foreachFunc` function to the underlying RDD generated in every micro-batch interval.
+
+The `foreachFunc` closure itself is executed sequentially on the driver node for every micro-batch cycle. This allows the driver program to inspect RDD metadata (e.g., the Time object, RDD statistics) and execute conditional logic.
+However, the logic _inside_ the function, such as any subsequent RDD transformation or action, is executed in parallel across the worker nodes of the cluster.
+
+This operator provides an essential '`escape hatch`' to the full RDD API, allowing developers to implement logic for sending data to external systems that lack built-in connectors such as custom dashboards and proprietary databases.
+
+As an output operator, `foreachRDD` registers the DStream as an output stream, causing the entire upstream computation graph to be materialized and executed by the scheduler.
+But, even within this output operator, the logic remains lazy: if `foreachFunc` does not contain an explicit action on the RDD, the RDD's computation will not be triggered, and the transformed data for that batch will be silently discarded.
+
+// ====
+// TODO: good example (Kafka?)
+// ====
+
+=== Design patterns for using `foreachRDD`
+`foreachRDD` is a powerful primitive that allows data to be sent out to external systems.
+However, it is important to understand how to use this primitive correctly and efficiently.
+
+One common mistake to avoid is the following, and this is tied to the problem of "`knowing where your code runs`" (also see Chapter 2).
+Often writing data to external system requires creating a connection object (e.g. TCP connection to a remote server) and using it to send data to a remote system. 
+For this purpose, a developer may inadvertently try creating a connection object in the driver program to save records in the RDDs, and then try to use it inside `foreachFunc`.
+However, as mentioned above, this function runs in parallel on the worker nodes.
+
+[source, scala]
+----
+dstream.forEachRDD { rdd =>
+    val connection = createNewConnection() // runs on driver node
+    rdd.forEach { record => connection.send(record) // runs on worker node
+    }
+    connection.close()
+}
+----
+
+This results in an error, because workers require the connection object, which has to be serialized to be sent over the network.
+However, these types of objects are typically not serializable.
+A possible workaround could be to create the connection inside `foreachFunc`.
+
+[source, scala]
+----
+dstream.forEachRDD { rdd =>
+    
+    rdd.forEach { record => 
+        val connection = createNewConnection() 
+        connection.send(record) 
+        connection.close()
+    }
+}
+----
+
+But now a connection is created for _each_ record, which is problematic because this type of object is not meant to be created that often.
+A better solution is to create a new connection for each partition, as shown in the code below.
+This uses the `foreachPartition` action available on RDDs.
+
+[source, scala]
+----
+dstream.forEachRDD { rdd =>
+    rdd.foreachPartition { records => 
+        val connection = createNewConnection() 
+        records.forEach(record => connection.send(record))
+        connection.close()
+    }
+}
+----
+
+Although this is a better solution, things may still go wrong when using very small window sizes and/or having extremely many partitions.
+Even better therefore is to avoid creating fresh connections, but rely on a _pool_ of connection objects.
+Every worker node will have its own pool of connections.
+Objects in the pool are lazily created.
+Whenever a worker asks the pool for a connectiom, either an existing connection is returned when available, or a new connection is created and returned.
+When the worker is finished using the connection, it must return it to the pool once it has finished using it.
+
+[source, scala]
+----
+dstream.forEachRDD { rdd =>
+    rdd.foreachPartition { records => 
+        val connection = ConnectionPool.getConnection()
+        records.forEach(record => connection.send(record))
+        ConnectionPool.returnConnection(connection)
+    }
+}
+----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+== Spark Structured Streaming
+Spark Structured Streaming is built directly on top of the Spark SQL engine. 
+Unlike the DStream API, which introduced a distinct type hierarchy (DStream vs RDD), Structured Streaming uses the exact same DataFrame and Dataset APIs used for <<ch:declarative,batch processing>>.
+
+The core abstraction of Structured Streaming is the unbounded table. 
+Conceptually, the system treats a stream of data not as a sequence of batches, but as a table that is being continuously appended to. 
+Every new data element arriving in the stream is considered a new row appended to this input table.
+
+[[sec:sql-streaming-unified-api]]
+=== Unified Dataset API
+Because the core abstraction is a table, it is possible to express streaming computations using standard DataFrame and Dataset transformations (`select`, `groupBy`, `filter`, `map`). 
+For example, the code written to process a static, bounded CSV file is identical to the code used to process a real-time Kafka stream. 
+This unification simplifies development, as users do not need to learn a separate API for streaming.
+
+Both batch and streaming computations rely on the exact same Dataset and DataFrame classes. 
+Unlike DStreams, where the type explicitly denotes the streaming nature (e.g., `DStream[String]`), a streaming Dataset has the same static type as a batch Dataset (e.g., `Dataset[String]`). 
+The streaming nature is not encoded in the type signature but is a runtime property of the execution plan, which can be inspected via the `isStreaming` property.
+
+[source,scala]
+def isStreaming: Boolean
+
+This property returns `true` if this Dataset contains one or more sources that continuously return data as it arrives.
+
+However, the unified API also results in <<sec:sql-streaming-actions,some constraints>>, resulting in  operations being unsupported when they make no sense in a streaming setting.
+
+// In the streaming model, the input is infinite, so a standard action cannot return a final result. 
+// Instead, streaming computations are configured using a <<sec:sql-streaming-queries,`DataStreamWriter`>> and triggered by calling `start` on the query.
+// This initiates a continuous background process that outputs results to a sink.
+
+=== Terminology
+We will use the term Dataset to refer to the unified API, encompassing both the statically-typed `Dataset[T]` and the dynamically typed `Dataset[Row]`. 
+Since DataFrame is formally defined as a type alias for the latter, the underlying abstraction is identical. 
+We may use the term DataFrames when referring to relational transformations (such as dynamically-typed grouping, windowing, and SQL-based aggregations) and operations that have no, or discard static type information and operate on generic Rows.
+
+=== Incremental Execution 
+While the logical query remains the same for batch and streaming (e.g., `df.groupBy("user").count()`), the physical execution is different. 
+In a batch context, an aggregation is computed by scanning the entire dataset. 
+In a streaming context, recomputing the entire aggregation from the beginning of the stream for every new data arrival is computationally infeasible.
+// true for all stateful operations like `distinct` and ``
+
+To address this, Structured Streaming employs _incremental_ execution.
+The Catalyst optimizer identifies operators in the logical plan (such as aggregations or joins) and maps them to physical operators that maintain intermediate state.
+When new data arrives, the engine uses this state to compute the updated result without reprocessing historical data. 
+For example, a running count is updated simply by adding the counts of the new batch to the existing state, rather than recounting all records ever received. 
+This ensures that the processing time remains proportional to the amount of new data, rather than the total volume of data seen so far.
+
+As an <<exa:sql-streaming-word-count,initial example>>, let's again consider word counting.
+
+[[exa:sql-streaming-word-count]]
+====
+The following code implements stateful word counting, illustrating the unified API.
+
+In the code below, `inputStream` is defined as a `MemoryStream[String]`, a streaming source useful for debugging purposes.
+When `toDS` is invoked on the stream, Spark creates a streaming Dataset consisting of one column.
+Since a `String` object has no internal field names (unlike a `case class` which has defined parameter names), Spark automatically names the single resulting column `"value"` (this is also the case with non-streaming Datasets).
+Each time the stream emits a `String`, a row containing that string value is appended to `lines`.
+
+The `flatMap` operation returns a new `Dataset[String]`, so again a table with one `"value"` column containing all words.
+The `groupBy("value")` operation references this specific column to perform the grouping, which results in a (streaming) `RelationalGroupedDataset`.
+`count` applies the aggregation and returns a DataFrame containing two columns: the grouping key (`"value"`) and the aggregate result (`"count"`).
+
+Finally, a streaming query is created by calling `writeStream` on the result of the aggregation (`wordCounts`).
+The <<sec:sql-streaming-output-modes,output mode>> is set to `"complete"`, which instructs Spark to generate the full current state, without distinguishing between updated or finalized rows.
+The output sink is specified as being the console, and the query is started.
+
+[source,scala]
+----
+import spark.implicits._
+
+implicit val sqlContext = spark.sqlContext
+val inputStream = MemoryStream[String]
+
+val lines: Dataset[String] = inputStream.toDS()
+val words: Dataset[String] = lines.flatMap(_.split(" "))
+val wordCounts: DataFrame = words.groupBy("value").count()
+
+val query = wordCounts.writeStream
+    .outputMode("complete")
+    .format("console")
+    .start()
+
+inputStream.addData(Seq("hello world", "hello spark"))
+query.processAllAvailable()
+// +-----+-----+
+// |value|count|
+// +-----+-----+
+// |hello|    2|
+// |spark|    1|
+// |world|    1|
+// +-----+-----+
+
+inputStream.addData(Seq("spark streaming", "structured streaming"))
+query.awaitTermination()
+// +----------+-----+
+// |     value|count|
+// +----------+-----+
+// |     hello|    2|
+// | streaming|    2|
+// |     spark|    2|
+// |structured|    1|
+// |     world|    1|
+// +----------+-----+
+----
+====
+
+<<exa:sql-streaming-word-count>> implements a stateful word count, and illustrates the unbounded table semantics in Structured Streaming.
+When implementing word count with DStreams (<<exa:dstream-window,with>> or <<exa:dstream-word-count-stateless,without>> windows), the variable `lines` represents a sequence of discrete RDDs.
+A transformation like `reduceByKey` applies to one (possibly unioned) RDD at a time and is stateless by default.
+In Structured Streaming, the variable <<exa:sql-streaming-word-count,`lines`>> represents the entire input table (past, present, and future data). 
+Every new micro-batch appends rows to this table.
+The expression `lines.groupBy("value").count()` expresses a query over that entire input table, not a finite slice of data.
+
+=== Architecture
+Internally, by default, Structured Streaming queries are processed using a micro-batch processing engine, which processes data streams as a series of small batch jobs.
+This can achieve end-to-end latencies as low as 100 milliseconds and exactly-once fault-tolerance guarantees. 
+
+==== Micro-batching
+By default, Structured Streaming executes queries using a micro-batch engine. 
+Rather than processing individual records sequentially, the engine waits for a trigger to fire. 
+Upon triggering, the driver polls the source to determine the latest available offsets, retrieves all new records accumulated since the last execution, and instantiates them as a single input Dataset. 
+This batch is logically appended to the unbounded table and processed incrementally to update the state and result table. 
+This architectural choice allows the Catalyst optimizer to apply vectorization and other high-throughput batch optimizations to the incoming data stream, avoiding the overhead associated with record-at-a-time processing.
+
+Consequently, the size of a micro-batch is not a fixed parameter but a dynamic function of the data availability.
+The size is determined by the ingestion rate and the time elapsed since the previous trigger.
+The trigger setting dictates the cadence of this execution cycle. 
+If left unspecified (the default), the system executes the next batch immediately after the previous one completes, meaning the batch size equals the data accumulated during the processing time of the previous batch.
+Alternatively, a fixed interval (e.g., 10 seconds) can be enforced, where the system attempts to process accumulated data at that specific cadence. 
+To prevent memory exhaustion during input bursts, explicit limits such as `maxOffsetsPerTrigger` can be configured. 
+This acts as a backpressure mechanism: if the accumulated volume exceeds the cap, the batch is limited to the specified size, and the remaining data is buffered at the source for subsequent triggers.
+
+****
+Spark offers an alternative, experimental execution mode called Continuous Processing, designed for workloads requiring millisecond-level latency. 
+Unlike the default micro-batch engine, this mode processes records individually. 
+However, this latency reduction incurs significant trade-offs: the consistency model weakens from exactly-once to at-least-once guarantees, and support for complex operations (most notably aggregations) is currently absent.
+Furthermore, fault tolerance is limited: task failures stop the query and require a manual restart rather than automatic retries.
+****
+
+== Creating Streaming Datasets
+Structured Streaming provides a unified API for reading data streams via the `DataStreamReader` interface, accessed through `spark.readStream`. 
+This interface mirrors the static `DataFrameReader` (`spark.read`) used for batch processing, requiring the specification of a format, a schema (for file-based sources), and configuration options.
+Spark supports several built-in sources for ingesting streaming data in production and testing environments.
+
+=== File Source
+A file source reads files written to a directory as a stream of data. 
+Supported formats include text, csv, json, orc, and Parquet.
+The system monitors the directory and processes new files as they appear. 
+This source requires a user-specified schema because the schema of future files cannot be inferred at runtime.
+
+[source,scala]
+----
+val fileStream = spark.readStream
+        .schema(userSchema)
+        .option("maxFilesPerTrigger", 1) // optional: limit rate 
+        .csv("/path/to/directory")
+----
+
+A Kafka source integrates with Apache Kafka. 
+This is the most common source for production pipelines due to its replayability and high throughput. 
+The source reads data from one or more topics and returns a DataFrame with a fixed schema containing standard Kafka fields: `key` (`Binary`), `value` (`Binary`), `topic` (`String`), `partition` (`Int`), `offset` (`Long`), timestamp (`Timestamp`), and `timestampType` (`Int`). 
+The binary key and value columns typically require casting to `String` or deserialization into a structure.
+
+[source,scala]
+----
+val kafkaStream = spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "host1:port1,host2:port2")
+        .option("subscribe", "topic1")
+        .load()
+----
+
+=== Socket Source
+A socket source reads UTF-8 text data from a socket connection. 
+This source is primarily used for testing and debugging, as it does not provide end-to-end fault tolerance: data in the TCP buffer is lost upon driver failure.
+
+[source,scala]
+----
+val socketStream = spark.readStream
+        .format("socket")
+        .option("host", "localhost")
+        .option("port", 9999)
+        .load()
+----
+
+=== Testing Source: `MemoryStream`
+For unit testing and deterministic debugging, Spark developers use the `MemoryStream` class. 
+It allows programmatic data ingestion, similar to the `QueueStream` in DStreams, enabling the injection of specific datasets into the stream to verify query logic.
+
+Class `MemoryStream` resides in the `org.apache.spark.sql.execution.streaming` package.
+In Spark, execution packages are generally considered internal and are excluded from the high-level public API documentation. 
+However, it is a standard tool for writing unit tests for Structured Streaming applications.
+
+[source,scala]
+----
+import org.apache.spark.sql.execution.streaming.MemoryStream
+implicit val sqlCtx = spark.sqlContext 
+import spark.implicits._
+val input = MemoryStream[String]
+val streamingDS = input.toDS()
+
+input.addData("value1", "value2")
+…
+----
+
+== Streaming Dataset Transformations
+// TODO: this could also be structured as stateless/stateful
+Structured Streaming supports the majority of standard operations, ranging from dynamically typed SQL-like relational transformations (`select`, `where`, `groupBy`) to statically typed functional transformations (`map`, `filter`, `flatMap`).
+However, semantic restrictions apply: operations that require the entire dataset to be available at once (such as global sorting without buffering) are <<sec:sql-streaming-support-output-mode,restricted or unsupported>>.
+
+=== Windows
+DStream micro-batching is based on _process time_: it is driven by the system clock at the moment of data processing. 
+DStream windowing is an explicit transformation (`window`, `reduceByKeyAndWindow`, ...) that alters the structure of the DStream. 
+It physically unions the RDDs from a sequence of micro-batches to form a larger RDD. 
+The window is a container for RDDs.
+Any logical window created on top of the physical tumbling window is strictly coupled to the micro-batch interval: window and slide duration must be exact multiples of the batch duration. 
+As a consequence, any "`10-minute window`" (physical or logical) consists of the data received by the system in the last 10 minutes. 
+
+Structured Streaming is designed for _event time_: data is assigned to a window based on a timestamp embedded within each event.
+Windowing is treated simply as a grouping key (a column) within a standard aggregation. 
+The window is a logical attribute of the data, not the execution graph.
+
+The function `window` assigns rows to one or more time windows based on the row's timestamp in column `timeColumn`. 
+Window starts are inclusive but the window ends are exclusive.
+
+[source,scala]
+def window(timeColumn: Column, windowDuration: String, slideDuration: String): Column
+
+It returns a column expression that represents the time bucket for a specific row.
+This column is typically of type `StructType`, containing the fields `start` and `end` of type `Timestamp`.
+Because it returns a Column, it can be used inside relational transformations like `groupBy` or `select`, just like any other column expression.
+This function is also supported in batch mode.
+
+The <<exa:sql-streaming-windowed-word-count,following example>> expresses aggregations over a sliding window.
+
+[[exa:sql-streaming-windowed-word-count]]
+====
+The following program implements a windowed word count based on event time. 
+Unlike previous examples where the input was a simple `String` (a line of text), the `MemoryStream` here ingests tuples of type (String, Timestamp). 
+The `flatMap` operation tokenizes the text line while propagating the timestamp to every resulting word, creating a dataset with the schema `(word, timestamp)`.
+
+The aggregation logic uses the `window` function to group data into 10-minute windows that slide every 5 minutes. 
+This configuration creates overlapping windows: the event occurring at `12:07:00` falls within both the `[12:00, 12:10)` and `[12:05, 12:15)` intervals. 
+Consequently, a single input record contributes to the aggregate counts of multiple windows.
+
+At `12:05`, the first result batch triggers.
+The second one follows at `12:10`, in which the counts for windows `[12:00, 12:10)` and `[12:05, 12:15)` are updated.
+At `12:10`, the final result table triggers, in which counts for windows `[12:05, 12:15)` and `[12:10, 12:20)` are incremented.
+
+The query uses <<sec:sql-streaming-output-modes,`outputMode("complete")`>> that outputs the entire result table (the complete set of all windows with their latest values) after every trigger.
+This is necessary because the query performs a global sort (`orderBy("window")`) on the result, which requires a finite dataset. 
+
+Finally, `option("truncate", false)` is used to prevent the console sink from truncating the long string representation of the window struct.
+
+[source,scala]
+----
+val inputStream = MemoryStream[(String, Timestamp)]
+
+val result = inputStream.toDS()
+    .flatMap { case (line, ts) => line.split(" ").map(word => (word, ts)) }
+    .toDF("word", "timestamp")
+    .groupBy(window($"timestamp", "10 minutes", "5 minutes"), $"word")
+    .count()
+    .orderBy("window")
+
+val query = result.writeStream
+    .outputMode("complete") // because we don't set a watermark
+    .format("console")
+    .option("truncate", false)
+    .start()
+
+def ts(str: String): Timestamp = Timestamp.valueOf(str)
+
+inputStream.addData(Seq(("cat dog", ts("2025-01-01 12:02:00")))) 
+inputStream.addData(Seq(("dog dog", ts("2025-01-01 12:03:00")))) 
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|cat |1    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|dog |3    |
+// +------------------------------------------+----+-----+
+
+inputStream.addData(Seq(("owl cat", ts("2025-01-01 12:07:00")))) 
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|owl |1    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|cat |2    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|dog |3    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|owl |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|cat |1    |
+// +------------------------------------------+----+-----+
+
+inputStream.addData(Seq(("dog", ts("2025-01-01 12:11:00")))) 
+inputStream.addData(Seq(("owl", ts("2025-01-01 12:13:00")))) 
+query.awaitTermination()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|owl |1    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|cat |2    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|dog |3    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|owl |2    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|cat |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|dog |1    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|owl |1    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|dog |1    |
+// +------------------------------------------+----+-----+
+
+----
+
+image::exa-sql-streaming-windowed-word-count.png[]
+[<<sql-streaming-watermarks>>] 
+
+====
+
+[[sec:sql-streaming-watermarking]]
+==== Late Data and Watermarking
+// TODO look at flow in slides
+With DStreams, windowing is a structural transformation of the stream's execution graph based on processing time. 
+This coupling makes it difficult to handle late-arriving data correctly, as data is assigned to a window based on _arrival_, not occurrence.
+Because of this, handling late data usually involves the data being dropped or erroneously included in the current (wrong) window.
+
+In Structured Streaming, however, windowing is a relational grouping operation based on occurrence or event time.
+Since windows are buckets based on event time, the system can keep an old window '`open`' in its state store to receive late data. 
+
+// insert figure here?
+
+The time a window remains open can be specified by a _watermark_.
+The watermark defines a specific threshold (e.g., "`10 minutes late`") after which the system may effectively drop the intermediate state for that window and consider it finalized.
+For example, with a watermark of 10 minutes, records belonging to the `[12:00, 12:10)` window are accepted at least as long as the system has not yet observed any event with a timestamp greater than 12:20.
+
+Without a watermark, the streaming engine assumes that data for any window, no matter how old, could arrive at any future point.
+Consequently, the engine retains the intermediate state (the partial aggregates) for every window observed since the inception of the aggregating query. 
+Old windows are never evicted from the state store. 
+As the stream progresses, the size of the state store grows indefinitely, proportional to the number of windows observed. 
+This inevitably leads to increased heap usage and eventual `OutOfMemoryError`.
+
+The method `withWatermark` can be applied on a Dataset to specify the point in time when it is assumed no more late data is going to arrive.
+
+[source,scala]
+def withWatermark(eventTime: String, delayThreshold: String): Dataset[T]
+
+`eventTime` is the name of the column that contains the event time, and `delayThreshold` specifies the minimum delay to wait before closing an active window.
+The watermark is computed by looking at `max(eventTime)` seen across all of the partitions in the query minus the `delayThreshold`.
+A window is active if its end time is after the watermark.
+If the watermark reaches or passes a window's end time, the window may be closed and evicted.
+
+Note that in windowed aggregations, Spark does not drop a row simply because `row.eventTime < watermark`. 
+Instead, it drops data only if the row cannot belong to any _active_ window. 
+This distinction is important for overlapping sliding windows, where a '`late`' record may be too late for an older window but still valid for a newer, active window.
+
+Also note that the guarantee of not dropping rows is only strict in one direction: Spark guarantees that windows remain open for _at least_ `delayThreshold` after their end time, but it is not guaranteed that a window closes at the exact moment that an event time is observed that is at or after `window.endTime + delayThreshold`.
+This is a consequence of the distributed nature of the processing: each partition may observe event-time progress differently, and coordinating a globally '`tight`' watermark would require expensive synchronization. 
+To avoid this overhead, Spark chooses to keep windows open longer and delay watermark advancement rather than aggressively closing windows or performing costly cross-partition coordination.
+
+[[exa:sql-streaming-windowed-word-count-watermarks]]
+====
+The following program demonstrates a windowed word count with a watermark of 10 minutes.
+The aggregation logic uses the same window-based grouping as in <<exa:sql-streaming-windowed-word-count>>, using 10-minute windows that slide every 5 minutes. 
+
+After processing each batch, the watermark is advanced to 10 minutes before the latest event time processed by the query so far.
+
+The example demonstrates how the watermark handles out of order or late data.
+For example, `(12:09, cat)` is out of order and late, but still is aggregated into windows `[12:00, 12:10)` and `[12:05, 12:15)`. 
+These windows are still open because the watermark at that point in the computation was only `11:58`.
+
+However, `(donkey, 12:04)` is ignored because windows `[11:55, 12:05)` and `[12:00, 12:10)`, where it would belong, are already closed as the watermark `12:11` at that point is already past the end times of those windows.
+
+The fact that latecomer `(bee, 12:10)` updates windows `[12:05, 12:15)` and `[12:10, 12:20)` even when the watermark already reached `12:11` clearly illustrates that events that are late with respect to the watermark are not simply and automatically ignored.
+
+Finally, this example demonstrates <<sec:sql-streaming-output-modes,`outputMode("update")`>>, which restricts the output to only those rows that were updated during the current trigger interval.
+
+[source,scala]
+----
+val inputStream = MemoryStream[(String, Timestamp)]
+
+val result = inputStream.toDS()
+    .flatMap { case (line, ts) => line.split(" ").map(word => (word, ts)) }
+    .toDF("word", "timestamp")
+    .withWatermark("timestamp", "10 minutes")
+    .groupBy(window($"timestamp", "10 minutes", "5 minutes"), $"word")
+    .count()
+
+val query = result.writeStream
+    .outputMode("update") 
+    .format("console")
+    .option("truncate", false)
+    .start()
+
+def ts(str: String): Timestamp = Timestamp.valueOf(str)
+
+inputStream.addData(Seq(("dog", ts("2025-01-01 12:07:00")))) 
+inputStream.addData(Seq(("owl", ts("2025-01-01 12:08:00")))) 
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|owl |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|owl |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|dog |1    |
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|dog |1    |
+// +------------------------------------------+----+-----+    
+println(s"watermark ${query.lastProgress.eventTime.get("watermark")}")
+// watermark 2025-01-01 11:58:00
+
+inputStream.addData(Seq(("dog", ts("2025-01-01 12:14:00")))) 
+inputStream.addData(Seq(("cat", ts("2025-01-01 12:09:00"))))
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|cat |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|cat |1    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|dog |2    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|dog |1    |
+// +------------------------------------------+----+-----+    
+println(s"watermark ${query.lastProgress.eventTime.get("watermark")}")
+// watermark 2025-01-01 12:04:00
+
+inputStream.addData(Seq(("cat", ts("2025-01-01 12:15:00")))) 
+inputStream.addData(Seq(("dog", ts("2025-01-01 12:08:00")))) 
+inputStream.addData(Seq(("owl", ts("2025-01-01 12:13:00")))) 
+inputStream.addData(Seq(("owl", ts("2025-01-01 12:21:00")))) 
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:00:00, 2025-01-01 12:10:00}|dog |2    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|dog |3    |
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|owl |2    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|cat |1    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|owl |1    |
+// |{2025-01-01 12:15:00, 2025-01-01 12:25:00}|cat |1    |
+// |{2025-01-01 12:15:00, 2025-01-01 12:25:00}|owl |1    |
+// |{2025-01-01 12:20:00, 2025-01-01 12:30:00}|owl |1    |
+// +------------------------------------------+----+-----+    
+println(s"watermark ${query.lastProgress.eventTime.get("watermark")}")
+// watermark 2025-01-01 12:11:00
+
+inputStream.addData(Seq(("donkey", ts("2025-01-01 12:04:00")))) 
+inputStream.addData(Seq(("bee", ts("2025-01-01 12:10:00")))) 
+inputStream.addData(Seq(("owl", ts("2025-01-01 12:17:00")))) 
+query.processAllAvailable()
+// +------------------------------------------+----+-----+
+// |window                                    |word|count|
+// +------------------------------------------+----+-----+
+// |{2025-01-01 12:05:00, 2025-01-01 12:15:00}|bee |1    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|bee |1    |
+// |{2025-01-01 12:10:00, 2025-01-01 12:20:00}|owl |2    |
+// |{2025-01-01 12:15:00, 2025-01-01 12:25:00}|owl |2    |
+// +------------------------------------------+----+-----+    
+println(s"watermark ${query.lastProgress.eventTime.get("watermark")}")
+// watermark 2025-01-01 12:11:00
+----
+
+image::exa-sql-streaming-windowed-word-count-watermarks.png[]
+[<<sql-streaming-watermarks>>] 
+
+====
+
+Watermarking serves primarily as a mechanism to constrain memory usage in _stateful_ transformations (primarily aggregations and joins, but also others such as `distinct` and `dropDuplicates`) by determining when intermediate state can be safely discarded. 
+In contrast, _stateless_ transformations such as `map`, `select` or `where` are processed independently on a row-by-row basis.
+Because these operations do not maintain a running state or buffer data across temporal windows, there is no requirement for event-time eviction logic: once computed, their results can never change. 
+Consequently, defining a watermark is unnecessary for stateless queries, as the concept of '`lateness`' does not influence the processing logic or resource management.
+
+==== Decoupling logical windowing from execution frequency
+In DStreams, window logic is strictly coupled to the physical execution model. 
+A window is essentially a concatenation of micro-batches (RDDs).
+Therefore, the window duration and slide duration are strictly coupled to the micro-batch interval: they must be exact multiples of the batch duration.
+Consequently, temporal discretization occurs at the source, controlled by the StreamingContext, using the system clock to cut continuous data into batches.
+The downstream analysis cannot be more granular than the batch duration, and sinks exercise no control over the data reception schedule.
+
+In Structured Streaming, the definition of time windows is orthogonal to the processing frequency. 
+The source is treated as a continuous, unbounded log, and discretization into micro-batches is an artifact of the execution engine instead, driven by the trigger interval defined at the sink. 
+When the trigger fires (based on the system clock), the engine queries the source to dynamically construct a micro-batch defined by the offset range [offset_last, offset_current]. 
+Thus, the source does not '`push`' batches; the engine '`pulls`' data based on the trigger schedule.
+
+This architecture decouples event-time window logic from the trigger interval. 
+A user may define 10-minute windows sliding every 5 minutes while configuring the query to trigger at an arbitrary frequency (e.g., every second or every hour). 
+The engine updates window states incrementally as data arrives, independent of the frequency at which results are committed to the external destination.
+
+====
+In this example, the logical requirement is to analyze 10-minute windows of data. 
+However, the physical requirement changes: we might want to see updates on a dashboard every second (`fastQuery`), or we might want to save resources and only write files once an hour (`slowQuery`).
+
+In Structured Streaming, the logical transformation remains identical in both cases, and only the trigger configuration (based on processing time) in the `DataStreamWriter` changes.
+This demonstrates that the frequency of execution (1 second vs. 1 hour) imposes no constraints on the granularity of the analysis (10 minutes). 
+The engine simply accumulates state for the 10-minute window in memory and commits the result only when the trigger fires.
+
+[source,scala]
+----
+val windowedCounts = sensorStream
+    .groupBy(window($"event_time", "10 minutes", "5 minutes"))
+    .count()
+
+val fastQuery = windowedCounts.writeStream
+    .trigger(Trigger.ProcessingTime("1 second"))
+    .outputMode("complete")
+    .format("console")
+    .start()
+
+val slowQuery = windowedCounts.writeStream
+    .trigger(Trigger.ProcessingTime("1 hour")) 
+    .outputMode("append")
+    .format("parquet")
+    .option("path", "/data/reports")
+    .withWatermark("event_time", "10 minutes")
+    .start()
+----
+====
+
+=== Joins
+We now look at the different combinations of joining streaming and static Datasets (except joing two static datasets, which we already covered in <<ch:declarative>>).
+For example, a '`stream-static`' join means "`joining a streaming with a static Dataset`": `streamingDs.join(staticDs)`.
+
+==== Stream-static and static-stream join
+When joining a streaming with a static Dataset, not all types of joins are supported.
+
+Take for example a stream-static join.
+When the join type is inner join or left outer join, then it can be processed incrementally: every time the streaming Dataset produces a new row, this has to be joined with every row in the static Dataset.
+In the case of the left outer join, the new row from the streaming Dataset is always preserved, even when there is no matching row in the static Dataset.
+This requires that only the static Dataset is kept in memory, which is not a problem because it does not grow.
+Additionally, for the two types of joins, any join result is final and therefore can be output and discarded.
+Joining a streaming with a static Dataset therefore happens incrementally but stateless.
+The joined result will grow as the streaming Dataset produces new rows, but the joined result is immediately final.
+There is no intermediate state, and watermarking is not required.
+
+However, a stream-static right or full outer join is not supported, because it would not make sense.
+These types of outer join would theoretically mean preserving the static rows that do not match any current row in the stream, emitting `NULL` for the streaming part.
+However, this is not possible because the streaming Dataset is unbounded and processing time only moves forward, so the engine can never conclusively determine that the static row will never match a future stream event.
+Watermarking does not help because watermarks only help with handling late data, but they do not provide information about future data.
+Event-time constraints on the streaming Dataset (e.g., `stream.time < static.time + 1 hour`) also do not help, as the static Dataset in memory is read-only, '`unmanaged`' data in which rows are not checked off once a match is no longer possible.
+
+In conclusion: only the rows of the streaming dataset can be preserved, and the resulting stream-static and static-stream joins are not stateful.
+
+[cols="1,1,1,1", options="header"]
+|===
+| Left Dataset
+| Right Dataset
+| Join Type
+| Supported?
+
+| *Stream*
+| Static
+| Inner
+| *Yes*
+
+| *Stream*
+| Static
+| Left Outer
+| *Yes* 
+
+| *Stream*
+| Static
+| Right Outer
+| *No* 
+
+| *Stream*
+| Static
+| Full Outer
+| *No*
+
+| Static
+| *Stream*
+| Inner
+| *Yes*
+
+| Static
+| *Stream*
+| Right Outer
+| *Yes* 
+
+| Static
+| *Stream*
+| Left Outer
+| *No* 
+|===
+
+
+[[sec:sql-streaming-join-stream-stream]]
+==== Stream-stream joins
+Unlike DStreams, joins in Structured Streaming do not require the application of a window transformation to the input streams to align micro-batches. 
+In Structured Streaming, the challenge of generating join results between two streams is that, at any point of time, the view of the dataset is incomplete for both sides of the join making it much harder to find matches between inputs. 
+Any row received from one input stream can match with any future, yet-to-be-received row from the other input stream. 
+As a consequence, all stream-stream joins are inherently stateful because the engine must buffer input to match records across trigger intervals.
+
+Buffering means the size of streaming state for both will keep growing indefinitely as all past input must be saved as any new input can match with any input from the past.
+However, in this case the two streaming Datasets must be kept in memory, which is problematic because they can grow indefinitely and may lead to memory exhaustion.
+
+To avoid unbounded state growth, two things must be defined:
+
+. *Event-time constraints* across the two inputs such that the engine can figure out when old rows of one input is not going to be required (i.e. will not satisfy the time constraint) for matches with the other input.
+This constraint can be defined in one of the two ways:
+
+.. Time interval join conditions, e.g., `JOIN ON leftTime BETWEEN rightTime AND rightTime + INTERVAL <x> HOUR`
+.. Join on event-time windows, e.g., `JOIN ON leftTimeWindow = rightTimeWindow`
+
+. *Watermarks* must be defined on both inputs such that the engine knows how delayed the input can be (similar to stateful aggregation).
+
+For inner joins, the event-time constraints are technically optional regarding the query's validity but operationally mandatory to prevent memory exhaustion. 
+When a constraint is present, the engine buffers records only within the specified temporal bounds relative to the watermark. 
+Upon detecting a match, the result is emitted immediately. 
+If no constraint is defined, all historical data is buffered indefinitely, as the engine cannot theoretically rule out a match arriving (much) later.
+
+For outer joins (left, right, and full), event-time constraints become strict semantic requirements. 
+Consider a left outer join: if a record arrives on the left stream, a match is emitted immediately if the right side is present. 
+However, if no match exists, a right watermark is required and the engine must wait until this watermark advances past the defined time constraint window. 
+Only then can it deterministically conclude that the record is missing on the right, permitting the emission of the row with `NULL` values and the subsequent eviction of the state. 
+This introduces a necessary latency for non-matching results that does not exist for successful matches.
+Without a right watermark, the engine can never finalize a non-match, and would wait indefinitely.
+
+Still for a left outer stream-stream join, although not mandatory for query validity, a watermark on the left stream is required for managing memory.
+As right rows do not generate `NULL` output in a left join, the engine buffers records from the right stream solely to match them against potential future records from the left stream.
+To drop a buffered right row, the engine must prove that no future left row will ever arrive to claim it.
+This proof can only come from a left watermark.
+
+In conclusion, adding event-time constraints as the fundamental requirement for bounding state growth applies generally for managing memory, although the specific enforcement mechanisms differ between inner and outer joins.
+Event-time constraints are mandatory for the semantic correctness of outer joins.
+
+[cols="1,1,2,2,2", options="header"]
+|===
+| Join Type
+| Supported
+| Watermark & Constraint
+| Result Emission Timing
+| State Store Behavior
+
+| *Inner*
+| Yes
+| *Optional* (recommended for state cleanup)
+| *Immediate* upon detection of a matching pair.
+| Buffers inputs indefinitely unless constraints are defined.
+
+| *Left Outer*
+| Yes
+| *Mandatory*
+| *Mixed* +
+Matches: immediate. +
+Nulls (on right): delayed until `watermark > window_end`.
+| Buffers both sides. Left side evicted after emission, right side evicted based on watermark.
+
+| *Right Outer*
+| Yes
+| *Mandatory*
+| *Mixed* +
+Matches: immediate. +
+Nulls (on left): delayed until `watermark > window_end`.
+| Buffers both sides. Right side evicted after emission, left side evicted based on watermark.
+
+| *Full Outer*
+| Yes
+| *Mandatory*
+| *Mixed* +
+Matches: Immediate. +
+Nulls: delayed until `watermark > window_end`.
+| Buffers both sides until watermark exceeds the event-time constraint.
+|===
+
+
+[[exa:sql-streaming-join-stream-stream]]
+====
+This example revisits <<exa:dstream-join-stateful>> where a stateful DStream `join` was used to match purchases to clicks that occurred within a previous time window of 5 seconds.
+We replicate this logic with a stream-stream inner join, using an event-time interval join condition to define the temporal relationship within the join condition. 
+
+In the first batch, a purchase and two click events for user `101` arrive in the same trigger.
+A click for user `102` also arrives, but there is no matching purchase yet.
+The first outut shows matches for `101`, while the click for `102` is buffered in the state store.
+
+In the second batch, a purchase for `102` arrives.
+The output shows this match, as Spark matches the new purchase (at `12:00:06`) with the buffered click (`12:00:04`) because the click is within the 5-second interval constraint.
+
+<<sec:sec:sql-streaming-output-modes,Append mode>> is required because the stream-stream inner join produces final, immutable results immediately upon matching, rendering `"update"` or `"complete"` modes not applicable.
+
+[source,scala]
+----
+val purchaseStream = MemoryStream[(Int, String, Timestamp)]
+val clickStream = MemoryStream[(Int, String, Timestamp)]
+
+// watermarks are mandatory for state cleanup in stream-stream joins
+val purchases = purchaseStream.toDS()
+    .toDF("p_id", "item", "p_ts")
+    .withWatermark("p_ts", "10 seconds")
+
+val clicks = clickStream.toDS()
+    .toDF("c_id", "ad", "c_ts")
+    .withWatermark("c_ts", "10 seconds")
+
+val joinCondition = expr("""
+    p_id = c_id AND
+    c_ts <= p_ts AND
+    c_ts >= p_ts - interval 5 seconds
+""")
+
+val joined = purchases.join(clicks, joinCondition)
+
+val query = joined.writeStream
+    .format("console")
+    .outputMode("append")
+    .start()
+
+def ts(s: String): Timestamp = Timestamp.valueOf(s)
+
+purchaseStream.addData(Seq((101, "lamp", ts("2025-01-01 12:00:05"))))
+clickStream.addData(Seq(
+    (101, "ad235", ts("2025-01-01 12:00:05")), 
+    (102, "ad38",  ts("2025-01-01 12:00:04")), 
+    (101, "ad47",  ts("2025-01-01 12:00:02"))  
+))
+query.processAllAvailable()
+
+purchaseStream.addData(Seq((102, "desk", ts("2025-01-01 12:00:06"))))
+clickStream.addData(Seq.empty)
+query.awaitTermination()
+----
+====
+
+//
+// A full outer join (often referred to as simply "outer join") represents the set-theoretic union of the left outer join and the right outer join. 
+// It preserves all tuples from both relations, regardless of whether the join predicate is satisfied.
+//
+
+[[sec:sql-streaming-actions]]
+==== Streaming Dataset "`Actions`"
+In the batch model, actions like `take`, `count`, `reduce`, `collect`, or `show` trigger the immediate execution of the query on a finite Dataset and return a result. 
+These immediate actions are unsupported on streaming Datasets, however.
+
+Take `count` as an example.
+Unlike the DStream API, where `RDD.count()` (returning `Long`) was repurposed to return a lazy streams (i.e., `DStream[Long]`), Structured Streaming <<sec:sql-streaming-unified-api,shares>> the underlying `Dataset` class with the batch API. 
+Consequently, method signatures are fixed at compile time, and `Dataset.count()` is statically defined to return a synchronous `Long`. 
+Since returning a final result from an unbounded stream is semantically undefined, these operations are disabled.
+
+Consequently, invoking synchronous actions on a streaming Dataset results in a runtime exception:
+
+    AnalysisException: Queries with streaming sources must be executed with writeStream.start()
+
+To perform aggregations like `count` in Structured Streaming, relational transformations (`groupBy(…).count()`) must be used rather than imperative actions.
+Logic is built using transformations only, and the <<sec:sql-streaming-queries,`DataStreamWriter`>> acts as the _exclusive_ mechanism to trigger execution by calling `start` on the query.
+
+== Streaming Dataset-specific Operations
+While the Dataset API is <<sec:sql-streaming-unified-api,unified>>, certain operations are required to address the specific mechanics of the streaming execution model. 
+We have already encountered `withWatermark` in the context of <<sec:sql-streaming-watermarking,handling late data>> and <<sec:sql-streaming-join-stream-stream,stream-stream joins>>, and `isStreaming` was briefly introduced in the API overview.
+
+The `isStreaming` property is a runtime check that returns `true` if the Dataset contains one or more sources that are streaming. 
+This is primarily used in code that must adapt its logic or output strategy depending on whether it is running in batch or streaming mode.
+It enables the construction of hybrid functions that operate correctly in both batch and streaming contexts.
+
+The `withWatermark` transformation is the mechanism for handling late data and bounding state. 
+It accepts an event-time column and a delay threshold (e.g., `"10 minutes"`). 
+Unlike standard transformations which manipulate data values, `withWatermark` modifies the query's metadata, instructing the engine to maintain state for a specific window of time and to discard input records that are older than the specified threshold. 
+When called on a batch Dataset, it becomes a no-op.
+
+[[sec:sql-streaming-queries]]
+== Streaming Queries (Output Operations)
+To initiate execution, a `StreamingQuery` must be defined using the `DataStreamWriter` interface (accessed via `Dataset.writeStream`). 
+This interface replaces standard batch actions and provides a fluent API for configuring output sinks, execution triggers, output modes, and fault-tolerance checkpoints.
+
+[source,scala]
+def start(): StreamingQuery
+
+====
+The following example defines a query that writes JSON files to a directory. 
+It configures a 1-minute trigger interval and specifies a checkpoint location, which is mandatory for ensuring fault tolerance and exactly-once processing guarantees.
+
+[source,scala]
+----
+wordCounts.writeStream.queryName("json_word_counts")
+                        .format("json")
+                        .outputMode("append")
+                        .trigger(Trigger.ProcessingTime("1 minute"))
+                        .option("checkpointLocation", "path/to/checkpoint/dir")
+                        .option("path", "path/to/destination/dir")
+                        .start()
+----
+====
+
+=== Output Sinks
+
+==== File Sink 
+Stores the output to a directory on a compatible file system (HDFS, S3, local). 
+Supported formats include parquet, json, csv, orc, and text.
+
+====
+[source,scala]
+----
+writeStream
+    .format("parquet") // or "json", "csv", etc. 
+    .option("path", "path/to/destination/dir")
+    .start()
+----
+====
+
+==== `ForeachBatch` Sink 
+Enables arbitrary computation on the output of every micro-batch. 
+It is the Structured Streaming equivalent of DStream's `foreachRDD`.
+
+====
+[source,scala]
+----
+writeStream.foreachBatch { 
+    (batchDS: Dataset[T], batchId: Long) =>
+        // transform and write batchDS to external systems
+        }.start()
+----
+====
+
+The provided function receives the output rows of the current micro-batch as a static Dataset along with a unique `batchId`. 
+Since fault tolerance mechanisms may cause a batch to be re-executed, the `batchId` should be used to implement idempotent logic (deduplication) or transactional writes. 
+This sink is typically used to write to multiple destinations simultaneously or to interface with systems that lack a built-in connector for Structured Streaming.
+
+==== Console Sink
+Prints the output to the standard output (console).
+This collects data to the driver node and is intended strictly for debugging low-volume streams.
+
+====
+[source,scala]
+----
+writeStream
+    .format("console")
+    .start()
+----
+====
+
+==== Memory Sink
+Stores the output as an in-memory table in the driver. 
+Like the console sink, this is intended for debugging and unit testing. 
+The data accumulates in memory and can be queried interactively using Spark SQL.
+
+====
+[source,scala]
+----
+writeStream
+    .format("memory") 
+    .queryName("resultTable")
+    .start()
+----
+
+// in a separate thread:
+// spark.sql("SELECT … FROM resultTable WHERE …").show()
+====
+
+Note that not all sinks support all <<sec:sql-streaming-output-modes,output modes>>. 
+For instance, file sinks generally require append mode, while console and memory sinks support complete mode for viewing aggregations.
+
+[[sec:sql-streaming-output-modes]]
+=== Output modes
+In a streaming system, the result of a query can evolve over time. 
+Unlike stateless transformations (where input rows map directly to output rows), stateful operations like aggregations produce results that change as new data arrives. 
+For example, the count of events in a specific window might start at 10, update to 15, and finally settle at 20. 
+The '`output mode`' defines the contract between the streaming engine and the external sink regarding which of these updates are emitted and when.
+
+This configuration is primarily relevant for stateful queries involving aggregations.
+For stateless queries, the behavior is effectively identical across modes, and for <<sec:sql-streaming-join-stream-stream,stream-stream joins>>, only append mode is supported.
+
+There are three output modes, each offering a different semantic guarantee:
+
+* *Append* (finality): this is the default mode. 
+The engine emits a row to the sink only when it is finalized and _guaranteed_ never to change again.
+For this, the engine relies on the watermark. 
+It suppresses the output of a window until the watermark passes the window's end time.
++
+This mode is required when the downstream system expects immutable data and cannot handle updates (e.g., a file system that cannot edit files once written, or a notification service that sends an email for every record received).
++
+The trade-off is that it introduces latency. 
+For example, a watermark delay of 1 hour implies that records will be held in memory for at least 1 hour before being emitted.
+
+* *Update* (freshness): the engine emits a row to the sink every time the result changes.
+If a new record updates the count for an existing window, the engine outputs the new updated count immediately, without waiting for the watermark.
+If a row has not changed since the last trigger, it is not output.
++
+This mode is ideal when downstream systems require the most up-to-date information and can handle '`upserts`' (e.g., a real-time analytics dashboard, or a NoSQL database updating a key-value pair).
++
+The trade-off is an increase in write throughput. 
+A single aggregate result might be written to the sink many times before it is finalized, potentially increasing costs if the sink charges per write.
+
+* *Complete* (snapshot): the engine emits the entire result table (the complete state) after every trigger.
+The sink is effectively overwritten with the latest snapshot of all aggregations computed so far.
++
+This is typically used for debugging or for aggregations where the total number of groups is small and stable (e.g., "`Total errors per server`" where the number of servers is fixed).
++
+The trade-off is computational cost and bandwidth usage. 
+The size of the output grows linearly with the size of the state, making it unsuitable for aggregations with many unique keys.
+// analogy: re-printing the entire telephone book every time a single person gets a new phone number
+
+Typical stateful streaming operations require either append or update mode, while complete mode is most useful for debugging.
+Application semantics describe how downstream applications use the streaming data.
+
+If the downstream application performs a side effect for every record it receives (e.g., sending a notification), append mode must be used. 
+Using update mode here would result in duplicate alerts for the same event as the aggregation refines its value.
+
+If the downstream application needs fresh results (e.g, displaying the current status in a dashboard), update mode must be used. 
+Using append mode here would render the dashboard useless, as it would display data only after it is significantly outdated (delayed by the watermark).
+
+// The three types of records that can be emitted are:
+// . Records that future processing does not change.
+// . The records that have changed since the last trigger.
+// . All records in the state table.
+
+[[sec:sql-streaming-support-output-mode]]
+==== Unsupported or conditionally supported operations
+Some streaming operations are not supported in all output modes. 
+
+.Sorting
+`sort` and `orderBy` are unsupported in append or update mode. 
+The engine cannot sort an unbounded stream because it cannot determine the final order until the stream terminates (which, by definition, it does not).
+It is only supported in complete mode where the output is treated as a static table snapshot.
+
+.Limit
+`limit` is unsupported in append or update mode, as returning the "`first N rows`" of an infinite stream is undefined and non-deterministic.
+It is supported only in complete mode.
+
+.Chaining Stateful Operations
+Chaining multiple stateful operators, such as applying `dropDuplicates` followed by a `groupBy().count()`, is supported, but requires strict watermark propagation.
+The watermark must be defined on the input and correctly preserved through each step so that every operator in the chain knows when to safely evict its intermediate state. 
+Generally, these pipelines are restricted to append output mode to avoid the semantic ambiguity of passing '`updated`' results between stateful steps.
+
+=== Operations on Streaming Queries
+Once a `StreamingQuery` is active, it allows for monitoring and control via the following methods.
+
+[source,scala]
+def stop(): Unit
+
+Stops the execution of the active query.
+This is used to programmatically halt the background stream processing.
+
+[source,scala]
+def awaitTermination(): Unit
+
+Blocks the current thread until the query terminates (either by `stop` or an exception). 
+This method exists because the `start` method is non-blocking: it launches the query in a background thread and returns control immediately.
+Without `awaitTermination`, the main thread of the driver program would finish execution and exit the JVM, inadvertently killing the active streaming query.
+
+[source,scala]
+def explain(): Unit
+
+Prints the physical execution plan to the console. 
+This is used to debug how the Catalyst optimizer has translated the logical DataFrame operations into physical micro-batch execution steps.
+
+[source,scala]
+def name(): String
+
+Returns the user-specified name of the query (set via `queryName`), or `null` if unspecified.
+This is useful for identifying specific queries when multiple streams are running concurrently.
+
+== Conclusion
+
+
+''''
+
+== Exercises
+
+=== Preliminaries
+
+==== Build file
+To use Spark Streaming, you must add the Spark Streaming library to your `build.sbt` file:
+
+    val sparkDependencies = Seq(
+      …
+      "org.apache.spark" %% "spark-streaming" % sparkVer % "provided"
+      )
+
+[[sec:feedstream]]
+==== Simulation of streaming sources
+Some exercises ask you to stream data from a file.
+You can use the following function to accomplish this.
+
+[source,scala]
+----
+import org.apache.spark.sql.Encoder
+
+def feedStream[T : Encoder](ms: MemoryStream[T], ds: Dataset[T], batchSize: Int): Unit = {
+  implicit val sqlCtx = ds.sparkSession.sqlContext
+  val iter = ds.toLocalIterator().asScala
+  iter.grouped(batchSize).foreach { batch =>
+    ms.addData(batch)
+    println("--- pushed batch ---")
+    Thread.sleep(1000)
+  }
+  println("--- no more batches ---")
+}
+----
+
+The `feedStream` function simulates a live data stream by incrementally injecting records from a static Dataset (which, for the exercises, you load from a file) into an active `MemoryStream`.
+The function accepts an existing `MemoryStream` as an argument.
+This design allows you to start your streaming query first and then call `feedStream` to '`pump`' data into it while it is running.
+
+====
+[source,scala]
+----
+…
+val ms = MemoryStream[Reading]
+val sensorStreaming: Dataset[Reading] = ms.toDS
+…
+val sensorData: Dataset[Reading] = spark.read
+    .option("delimiter", ",")
+    .schema("id STRING, temp DOUBLE, ts TIMESTAMP")
+    .csv(path)
+    .as[Reading]
+    .persist()
+feedStream(ms, sensorData, batchSize = 5)
+----
+====
+
+[[ex:streaming-word-count]]
+=== Exercise 1: Streaming word count
+Transform the code of <<ex:word-count>> into a streaming solution.
+Set up a directory that is monitored with a `textFileStream`.
+Whenever a new text file appears in that directory, its words should be counted.
+
+Use blocking method https://downloads.apache.org/spark/docs/{spark-version}/api/scala/org/apache/spark/streaming/StreamingContext.html#awaitTermination():Unit[org.apache.psark.streaming.StreamingContext.awaitTermination()] to keep the driver program alive and prevent the main application thread from exiting.
+
+Implement a version that implements a stateless word count (i.e., count per file) and a stateful or '`running`' word count (i.e., total word count over all files) using `updateStateByKey`.
+
+[[ex:dstream-live-wikipedia]]
+=== Exercise 2: Live Wikipedia Analysis
+Calculate the top 5 most active users by number of edits on Wikipedia in the last 30 seconds, updating every 10 seconds.
+Exclude users whose names contain the sequence `"bot"` (case-insensitive).
+
+You can tap into the real-time stream of edits happening on Wikipedia globally by using the Server-Sent Events (SSE) API provided by Wikimedia.
+To bridge this HTTP stream into Spark's `socketTextStream`, use the following shell command (in another terminal):
+
+    curl -s https://stream.wikimedia.org/v2/stream/recentchange | grep --line-buffered "data: " | nc -lk 9999    
+
+The data arrives as JSON strings.
+Use the function `parseUser` below to map down JSON objects to a `user` property.
+
+[source, scala]
+----
+def parseUser(json: String): Option[String] = {
+    val pattern = """.*"user":"([^"]+)".*""".r
+
+    json match {
+    case pattern(user) => Some(user)
+    case _             => None
+    }
+}
+----
+
+Your output should resemble something like this:
+
+    -------------------------------------------
+    Time: 1763847730000 ms
+    -------------------------------------------
+    (AvneyMoreshet,89)
+    (Ladsgroup,49)
+    (Doc James,36)
+    (Herzi Pinki,34)
+    (Sara Mouse,22)
+    ...
+
+    -------------------------------------------
+    Time: 1763847740000 ms
+    -------------------------------------------
+    (AvneyMoreshet,100)
+    (Ladsgroup,80)
+    (Doc James,64)
+    (Herzi Pinki,37)
+    (Plaça de Maig,26)
+    ...
+    
+    …
+
+[[ex:map-with-state]]
+=== Exercise 3: Map with state
+In <<ex:streaming-word-count>>, you implemented a stateful word count using `updateStateByKey`. 
+While functional, this transformation has a significant performance limitation: its execution time scales linearly with the total number of unique keys in the state. 
+Even if only a few new words appear in a batch, `updateStateByKey` iterates over the entire history of all words to check for updates.
+
+A more efficient alternative is `mapWithState`, defined for Pair DStreams. 
+This transformation applies updates only to the keys that are actually present in the incoming micro-batch, leaving the rest of the state untouched. 
+This results in a performance cost proportional to the number of active keys in the batch rather than the total state size, offering significant performance improvements for workloads with large state but sparse updates.
+
+Refactor your solution from <<ex:streaming-word-count>> to use `mapWithState` instead of `updateStateByKey`.
+Read the Spark documentation to figure out how this operation should be used.
+
+[[ex:sql-streaming-stream-static-enrichment]]
+=== Exercise 4: Stream-static enrichment
+A common pattern in streaming analytics is '`enrichment`', where incoming high-velocity raw events (the stream) are augmented with reference data (static) to provide context.
+
+In this scenario, you manage a network of IoT temperature sensors. 
+The sensors transmit raw data: 
+    
+    {sensor_id STRING, temperature DOUBLE, timestamp TIMESTAMP} 
+    
+To determine if a temperature is critical, you need to know the specific safety threshold for the location where that sensor is installed. 
+This information is stored in a static lookup table that contains the following:
+
+* Sensor `"s1"`: located in `"Server Room"`, threshold `25.0`
+* Sensor `"s2"`: located in `"Office"`, threshold `28.0`
+* Sensor `"s3"`: located in `"Freezer"`, threshold `-10.0`
+* Sensor `"s4"`: located in `"Warehouse"`, threshold `20.0`
+* Sensor `"s5"`: located in `"Fridge"`, threshold `5.0`
+
+Write a Structured Streaming program that joins a stream of sensor readings with a static dataset of sensor metadata.
+Stream the data from the `thermometer` dataset using the <<sec:feedstream,`feedStream`>> utility function
+The query should output an alert only when a sensor's temperature exceeds the threshold defined for its specific location.
+
+Your initial output (`batchSize = 5`) should be the following:
+
+    +-------------------+-----------+----+---------+
+    |ts                 |location   |temp|threshold|
+    +-------------------+-----------+----+---------+
+    |2025-01-01 12:00:00|Server Room|26.0|25.0     |
+    |2025-01-01 12:01:00|Freezer    |-5.0|-10.0    |
+    +-------------------+-----------+----+---------+
+    …
+
+// POSSIBLE exercises
+
+// DS: joining different window intervals for trend analysis
+
+// SS: join on event-time windows iso. time-range conditions (as in exa:sql-streaming-join-stream-stream in the text)
+
+// SS: distinct/dropDuplicates (stateful operations requiring watermark)
+
+// SS: `limit` unsorted + append = non-deterministic; sorted + append = unsupported; sorted + complete = supported

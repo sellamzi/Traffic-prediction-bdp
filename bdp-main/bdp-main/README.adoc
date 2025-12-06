@@ -1,0 +1,48 @@
+= Big Data Processing
+
+Welcome to the repository of the *Big Data Processing* (BDP) course.
+
+This repository contains everything needed for this course.
+
+WARNING: This course is in the process of being built.
+The main ideas and learning objectives are clear, but turning this into course material takes a lot of time and effort!
+Chapters, exercises, programs, etc. will appear when they are finished, and may be subject to change.
+Apologies for any inconvenience all this may cause.
+
+== Installation and Cloning
+
+The proposed environment to work in is VSCode + git + Docker Desktop.
+Everything you need to run code using Spark, Flink, Kafka is contained in this repository.
+See xref:text/bdp.adoc#sec:exercises-1[exercises] of Chapter 1 for more information.
+
+WARNING: This is an LFS repository, so you must have https://git-lfs.com/[git LFS] installed.
+
+== Course Text
+
+The chapters that are completed can be found xref:text/bdp.adoc[here].
+
+== Slides
+
+Slides for each chapter can be found link:slides[here].
+
+== Exercises
+
+Are at the end of every chapter in the xref:text/bdp.adoc[course text].
+
+== Project
+
+The project will be announced in week 8.
+
+== Sample and Example "Hello" Programs
+The link:examples[examples] directory contains simple "hello" programs that show off some functionality.
+In their respective `README.md` you can find commands that are useful to understand how to run or submit the program, test it or view some logs, alongside other related/revelant commands.
+
+In this directory you can also find the example code that is used in the course text.
+
+== Scala
+
+This course uses Scala 2.x as the main programming language.
+In addition to a wealth of information you can find online, a short introduction/overview can be found link:slides/scala-intro[here].
+
+== References
+* build.sbt files inspired by https://github.com/tillrohrmann/flink-project/blob/master/build.sbt (to make it so that `sbt run` sees all `"provided"` jars on the classpath, while `sbt assembly` excludes them from the resulting jar)

@@ -1,0 +1,7 @@
+.exercises {
+  background-color: red; /* A light grey */
+  padding: 1em 1.5em;
+  border-left: 5px solid #007bff; /* A blue accent border */
+  border-radius: 5px;
+  margin-top: 1.5em;
+}

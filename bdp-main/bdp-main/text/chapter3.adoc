@@ -1,0 +1,1539 @@
+[[ch:declarative]]
+= Declarative Data Processing
+// TODO rewrite in a more general style, and then move to Spark SQL.
+The original RDD API is fundamentally imperative. 
+It provides powerful, low-level control, but it forces the developer to specify the exact sequence of steps to get to a result (the '`how`'). 
+The programmer acts as the optimizer, making critical decisions that have significant performance implications, as we have seen in <<ch:batch>>.
+
+For example, a developer using RDDs must consciously choose between `reduceByKey` and the less efficient `groupByKey().map(...)`.
+They must decide the optimal order for `filter` and `join` operations and manually determine when and what to persist. 
+This provides immense flexibility but places the burden of performance squarely on the developer, who must have a deep understanding of the physical execution model to write efficient code.
+
+The limitations and complexity of the imperative model led to the development of _declarative_ APIs in Spark, namely DataFrames, Datasets, and Spark SQL. 
+In a declarative model, the developer specifies _what_ data they want, not how to compute it.
+
+The developer writes a query using familiar operations like `select`, `filter`, `groupBy`, and `join` via <<sec:dataframe-operations, functional-style methods>> or an actual <<sec:dataframes-sql, SQL query>>.
+This query represents the _logical_ intent, i.e., the desired final result. 
+This high-level plan is then passed to a sophisticated query optimizer, <<sec:catalyst, Catalyst>>, which is a core part of Spark SQL.
+
+This shift from '`how`' to '`what`' provides three main advantages:
+
+. Performance through optimization: Catalyst can often generate a more efficient execution plan than an average developer can. 
+It automatically applies complex optimizations like '`predicate pushdown`' (filtering data at the source), column pruning (reading only necessary columns), and join reordering (choosing the optimal join strategy).
+
+. Simplicity and accessibility: declarative APIs are generally simpler and more concise. 
+They lower the barrier to entry, allowing a wider range of users, including data analysts familiar with SQL, to leverage the power of distributed computing without needing to understand the low-level execution details.
+
+. Future-proofing: because the user's code specifies only the logical intent, the underlying Spark execution engine can be improved without requiring any changes to the user's queries. 
+A query written for Spark 2.0 might run significantly faster on Spark 4.0 simply because the Catalyst optimizer became smarter.
+
+== Motivational example: selecting scholarship candidates
+Imagine you are part of an organization offering scholarships to students.
+The data you need is split across two datasets: one with personal demographics and another with financial information, both linked by a common id.
+
+First, you set up the data by defining case classes for the schemas and loading the files into RDDs.
+
+[source, scala]
+----
+case class Demographics(
+  id: Int,
+  age: Int,
+  codingBootcamp: Boolean,
+  country: String,
+  gender: String,
+  isEthnicMinority: Boolean,
+  servedMilitary: Boolean)
+
+case class Finances(
+  id: Int,
+  hasDebt: Boolean,
+  hasFinancialDependents: Boolean,
+  hasStudentLoans: Boolean,
+  income: Int)  
+
+val demographics: RDD[(Int, Demographics)] = 
+  sc.textFile(...).map(parseD).map(d => (d.id, d)).persist()
+val finances: RDD[(Int, Finances)] =
+  sc.textFile(...).map(parseF).map(f => (f.id, f)).persist()
+----
+
+Your organization wants to count the number of potential candidates for a specific scholarship.
+To qualify, an applicant must meet three criteria:
+
+. They are from "Belgium" (from the demographics data).
+
+. They have financial debt (from the finances data).
+
+. They have financial dependents (from the finances data).
+
+Let's first work this out in plain Spark using RDDs. 
+A first strategy could be to `join` the `demographics` and `finances` RDDs, then `filter` the combined records, and finally `count` the results.
+
+.Solution 1: join and filter
+[source, scala]
+----
+demographics.join(finances) // type is RDD[(Int, (Demographics, Finances))]
+  .filter { case (id, (demographics, finances)) =>
+    demographics.country == "Belgium" &&
+    finances.hasDebt &&
+    finances.hasFinancialDependents
+  }.count()
+----
+
+An alternative and more efficient strategy is to <<sec:filter-early, filter early>> by performing a `filter` on both RDDs _before_ the `join`. 
+
+.Solution 2: filter, filter, and join
+[source, scala]
+----
+val filteredFinances: RDD[(Int, Finances)]  = finances.filter { case (id, fin) =>
+  fin.hasDebt && fin.hasFinancialDependents 
+}
+demographics.filter { case (id, demo) =>
+  demo.country == "Belgium"
+}.join(filteredFinances).count()
+----
+
+Another "`solution`" is the brute-force approach: first, compute the `cartesian` product of both RDDs, then `filter` to find pairs with matching IDs, and finally `filter` again for the scholarship criteria.
+
+[[exa:students-cartesian-solution]]
+.Solution 3: cartesian, filter, filter
+[source, scala]
+----
+val cartesian: RDD[((Int, Demographic), (Int, Finances))] = demographics.cartesian(finances)
+cartesian.filter {
+    case (p1, p2) => p1._1 == p2._1 // manually perform the join
+  }.filter {
+    case (p1, p2) => 
+        p1._2.country == "Belgium" &&
+        p2._2.hasDebt &&
+        p2._2.hasFinancialDependents
+  }.count()
+----
+
+The performance of each of the three solutions for some fixed number of candidates is depicted in <<fig:performance-candidates>>.
+
+[[fig:performance-candidates]]
+.Performance of the three solutions
+image::performance-candidates.png[]
+
+Joining the datasets and then filtering (solution 1) took about 5 seconds, filtering each dataset before joining (solution 2) was about 3.6 times faster, and taking the cartesian product and then filtering (solution) was about 177 times slower than the first solution and off the charts.
+
+The fact that solution 3 is the slowest is not surprising, since taking the cartesian product in this case is probably the worst you can do.
+This solution is functionally correct but catastrophically inefficient and should never be used in practice.
+The cartesian operation computes the Cartesian product of the two RDDs, creating a pair for every record in demographics with every record in finances. 
+For example, if you have 1 million demographic records and 1 million finance records, the cartesian RDD will contain one trillion (10^12) records.
+This operation requires a massive, all-to-all network shuffle and creates an explosively large intermediate dataset. 
+The subsequent `filter` operations are then forced to sift through this enormous RDD.
+
+The optimized `join` operation used in solutions 1 and 2 is designed specifically to avoid this data explosion by only shuffling and combining records that share the same key. 
+
+Solution 1 is the most intuitive way to write the query. 
+It directly translates the problem's logic: first, `join` the two datasets, then apply a single `filter` to the combined result. 
+While simple to write, this approach is inefficient because it forces Spark to shuffle the entire `demographics` and `finances` datasets, only to discard most of the data after the expensive `join`.
+
+Solution 2 is significantly more performant but requires the developer to act as the optimizer.
+It's more complex to write because you must manually apply two separate `filter` operations before the `join`.
+This technique drastically reduces the amount of data that must be shuffled, making the job far more efficient.
+
+Ideally, we want to write code in the "natural" style of Solution 1 but receive the optimized performance of Solution 2.
+This is achieved by moving to a higher level of abstraction: from an imperative model (where the developer specifies the how, e.g., "`join, then filter`") to a declarative model (where the developer specifies the what, e.g., "`I want a count of these joined and filtered records`").
+
+When the developer provides a declarative query, the framework's optimizer has the freedom to analyze this "`what`" and automatically find the best "`how`". 
+It can rewrite the query, reorder operations, and choose the most efficient physical plan. 
+This means the optimizer can perform the "`filter early`" optimization from solution 2, without the developer having to think about it.
+
+We already encountered an example of a declarative specification that is turned into an optimal imperative implementation: the RDD <<sec:lineage, lineage graph>> itself.
+The lineage is a declarative description of the transformations, which Spark's scheduler turns into an imperative execution plan of stages and tasks. 
+However, the RDD API is still "`low-level`" because the developer is the one manually defining the steps in that lineage.
+
+== Unstructured vs. Structured Data
+An optimizer needs information about the structure of both the data and the operations, which the RDD API cannot provide. 
+An RDD treats each record as an opaque object, and its transformations (like `map`) contain arbitrary user code. 
+This "`black box`" nature prevents the optimizer from understanding the data's internal fields, making it impossible to perform optimizations like early filtering or pruning of unnecessary data.
+
+To enable such optimizations, a framework must understand the data's schema. 
+Data can be broadly categorized by its level of structure.
+
+* *Unstructured data* lacks any predefined data model or internal organization.
+The system has no knowledge of its contents, only that it is a block of data.
+Examples include the content of a plain text document, or an image file. 
+
+* *Semi-structured data* does not conform to a rigid, formal schema but contains internal markers, tags, or metadata that separate semantic elements. 
+This self-describing organization makes them parsable and allows systems to extract specific information, even if the structure is not fixed or consistent across all records.
+Examples include log files, JSON, and XML.
+
+* *Structured data* adheres to a rigid, predefined schema.
+It is typically tabular (rows and columns) where the name, data type, and constraints of each column are strictly enforced.
+The structure is defined externally from the data itself.
+The most prominent examples is a table in a relational database. 
+
+=== Unstructured and Semi-Structured Data in an RDD
+The RDD API is powerful, but it treats the data it holds as opaque, and thus unstructurd. 
+This prevents Spark from performing many automatic optimizations.
+
+Consider an RDD of `Account` objects:
+
+[source, scala]
+----
+case class Account(name: String, balance: Double, risk: Boolean)
+val accounts: RDD[Account] = sc.textFile(…).map(line => parseAccount(line))
+----
+
+Within the Scala type system, this RDD has a clear, static structure. 
+The Scala compiler knows an `Account` has a `name`, a `balance`, and a `risk` field, and it enforces their types at compile time.
+
+However, to Spark, `accountsRdd` is just a collection of opaque blocks of data. 
+When you apply a transformation, you are providing a '`black box`' Scala function; for example
+
+[source,scala]
+accountsRdd.filter(account => account.balance > 1000)
+
+Spark's optimizer only sees a generic `filter` operation with user code it cannot analyze. 
+It has no awareness of the internal structure of an `Account` record. 
+It cannot "`peek inside`" the function to see that you are only accessing the `balance` column. 
+This opaqueness means Spark cannot perform optimizations like column pruning (reading only the `balance` column from disk) or filtering early.
+
+This contrasts sharply with a database. 
+In a database, data is stored in a table with a schema.
+A schema is a formal structure of columns, names, and types. 
+This schema is transparent, allowing a query optimizer to analyze a query clause like `WHERE balance > 1000` and create an efficient plan, such as using an index. 
+For Spark to achieve this, it also needs a "`database view`" of the data and operations, which is precisely what Spark SQL provides.
+
+== Spark SQL
+Spark SQL is a module in Apache Spark that allows you to work with structured and semi-structured data using declarative SQL queries and the DataFrame and Dataset API.
+
+Spark SQL was designed to achieve three primary goals:
+
+. Provide a unified relational API that offer a declarative, relational processing layer on top of Spark's core. 
+This includes both a `friendly` DataFrame API (for Scala, Python, etc.) and the ability to execute standard SQL queries.
+
+. Ensure high performance by using advanced, database-inspired techniques for query optimization. 
+This is accomplished by the Catalyst optimizer, which analyzes relational queries and generates a highly efficient physical execution plan, and the Tungsten core execution engine.
+
+. Unify data sources by creating a single interface for working with diverse data formats. 
+This allows Spark to read, write, and query data from structured sources (like databases), semi-structured sources (like JSON), and other external systems (like HDFS or S3) using the same API.
+
+=== Architecture
+Spark SQL is a module that provides a relational processing layer on top of the core Spark engine.
+While it used to be an optional '`add-on`', it is now the central and primary interface of Spark.
+
+* API: DataFrames 
+The primary interface for Spark SQL is the DataFrame API, which also includes Datasets and SQL strings. 
+When you write a query using this API, you are not writing RDD transformations. 
+Instead, you are building a declarative logical plan (a "blueprint" of what you want, not how to execute it).
+
+* Optimizer: Catalyst
+The logical plan is handed to the Catalyst optimizer, which sits at the core of Spark SQL. 
+Catalyst is a sophisticated query optimizer that applies techniques from the database world to your plan. 
+It analyzes this blueprint and automatically rewrites it into the most efficient physical execution plan possible. 
+
+* Execution
+All Spark jobs, regardless of the API used, are ultimately converted into a physical DAG of RDDs.
+"`Regular`" RDD code _is_ the RDD graph.
+Catalyst, on the other hand, takes the logical plan expressed by DataFrames and compiles it into a different physical DAG of RDDs that contain optimized bytecode generated by Tungsten.
+Because the final execution runs on the same core engine, you can  mix high-level DataFrame code with low-level RDD code in the same program.
+You can easily convert a DataFrame to an RDD (`.rdd`) to perform complex operations and then convert it back to a DataFrame (`.toDF()`) to leverage the optimizer (but this conversion comes at a cost).
+
+* Entry points
+This entire system can be accessed in several ways: within a Spark program, from interactive shells (like spark-shell or spark-sql), or from external BI tools through a JDBC connection.
+
+[[fig:spark-sql-architecture]]
+.Spark SQL architecture.
+image::spark-sql-architecture.png[,400]
+
+== Dataframes
+The core abstraction in Spark SQL is the DataFrame. 
+Conceptually, a DataFrame is equivalent to a table in a relational database or a spreadsheet: it organizes data into a two-dimensional structure of rows and named columns.
+
+An RDD is a collection of opaque objects (like `Account` or `String`) into which Spark cannot peek.
+A DataFrame, in contrast, is an RDD of `Row` objects with a schema (`Row` is a generic container representing the values of a single record).
+This schema provides explicit, structured information to Spark about the column names (e.g., `name`, `balance`) and their types (e.g, `StringType`, `DoubleType`).
+
+****
+DataFrames are described as being '`untyped`', but this is technically incorrect.
+Untyped here actually signifies that there is no _static_ type for the elements of a DataFrame.
+A DataFrame _is_ typed, but the '`useful`' type information is contained in the schema, which is checked at runtime.
+****
+
+This structural information is the key to optimization, and it introduces a new programming model:
+
+* DataFrames are _dynamically_ typed. 
+This means the Scala compiler does _not_ validate your code against the schema at compile-time. 
+A query like `salesDf.select($"categorie")` will always compile successfully, even if the column is misspelled.
+
+* The schema is checked at runtime when an action is called. 
+At that moment, the Catalyst optimizer analyzes the logical plan against the known schema to generate an efficient _physical_ plan.
+If a column is misspelled, an `AnalysisException` is thrown at _runtime_.
+
+DataFrames augment the RDD API containing regular RDD transformations that take opaque lambda functions with a rich set of declarative, structured transformations like `select`, `filter`, `join`, and `groupBy`.
+
+=== Creating DataFrames
+DataFrames can be created using the SparkSession object, which is the SparkContext for Spark SQL.
+Once you have a SparkSession, you can create a DataFrame in two ways:
+
+Once you have a SparkSession object, DataFrames can be created in two ways:
+
+. From an existing RDD, either with schema inference (automatic), or with explicit schema (manual).
+
+. Reading a specific data source from file. 
+Typically for common structured or semi-structured formats such as JSON.
+If it is already semi-structured, then the schema information can also be automatically inferred.
+
+==== Creation from existing RDD with inferred schema
+
+.DataFrame creation from an existing RDD with inferred schema
+[[exa:dataframe-creation-RDD-inferred]]
+====
+The code example below demonstrates the primary ways to create a DataFrame from an existing RDD, highlighting how Spark infers the schema (column names and data types) in each case.
+
+`df`: inference from an RDD of tuples
+When calling `toDF` on a standard RDD of tuples like `salesRdd` without specifying arguments, Spark can infer the data types but has no information about the intended column names.
+As the first call to `printSchema` shows, Spark's default behavior is to assign generic, positional names: `_1`, `_2`, and `_3`.
+
+`dfNames`: manually specifying column names
+You can provide the desired column names by passing string arguments to `toDF`.
+Spark still infers the data types, but it now uses the provided names instead of the defaults.
+
+`dfRef`: inference from a case class
+The final method demonstrates the most common and robust pattern in Scala using an RDD of some `case class` type.
+Because the `case class` explicitly defines both the names and the types of the fields, Spark can use this rich information to infer the entire schema automatically via reflection.
+This is the preferred method as it's self-documenting and less error-prone.
+
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+
+val salesRdd: RDD[(String, String, Double)] = sc.parallelize(salesData)
+
+val df = salesRdd.toDF()
+df.printSchema()
+// root
+// |-- _1: string (nullable = true)
+// |-- _2: string (nullable = true)
+// |-- _3: double (nullable = false)
+
+val dfNames = salesRdd.toDF("category", "store", "amount")
+dfNames.printSchema()
+// root
+// |-- category: string (nullable = true)
+// |-- store: string (nullable = true)
+// |-- amount: double (nullable = false)
+
+case class Sale(category: String, store: String, amount: Double)
+
+val salesRddCase: RDD[Sale] = 
+  salesRdd.map { case (category, store, amount) => Sale(category, store, amount) }
+
+val dfRef = salesRddCase.toDF()
+dfRef.printSchema()
+// root
+// |-- category: string (nullable = true)
+// |-- store: string (nullable = true)
+// |-- amount: double (nullable = false)
+----
+====
+
+Note that the types shown in the printed schemas of <<exa:dataframe-creation-RDD-inferred>> do not start with an upper case.
+For example, the type of the field `category` is `string` and not `String`.
+This is because the type of the fields are the Spark SQL types, and not the regular Scala types.
+The Scala `String` type is used during compile-time, while the Spark SQL `string` type is solely used by the Catalyst optimizer at runtime.
+
+==== Creation from an RDD with a manual schema
+While schema inference from sources like JSON or Scala case classes is common, there are cases where you must manually define a schema. 
+This is necessary when working with raw data sources, like CSVs or text files, where the schema is not embedded in the data.
+
+This process involves creating a `StructType` that defines the schema and applying it to an RDD of `Row` objects.
+
+* `StructField` is the smallest unit of a schema. 
+It defines a single column, specifying its name (e.g., `"category"`), data type (e.g., `StringType`), and whether it is nullable.
+
+* `StructType` defines the entire schema for the DataFrame. 
+It is essentially a collection (e.g., a `Seq`) of `StructField` objects.
+
+The creation is a two-step process:
+
+. The raw RDD (e.g., `RDD[String]`) is transformed into an `RDD[Row]`. 
+A Row is a generic, dynamically typed container object that represents a single record (a single row in the table, consisting of multiple fields). 
+This transformation requires you to manually parse the raw data and construct `Row` objects, ensuring the order and types of the elements in the `Row` match the schema you intend to apply.
+
+. Second, you call `spark.createDataFrame(rowRdd, schema)`, which takes the `RDD[Row]` and the `StructType` and binds them together to create a DataFrame.
+The DataFrame object '`wraps`' the `RDD[Row]` with the `StructType` schema. 
+The `RDD[Row]` holds the distributed, partitioned data, while the schema provides the critical metadata that Spark's Catalyst optimizer needs to analyze and optimize your queries.
+
+// TODO: schema method on DataFrameReader
+
+.DataFrame creation from an existing RDD with manual schema
+[[exa:dataframe-creation-RDD-manual]]
+====
+[source, scala]
+----
+val schema = StructType(Seq(
+  StructField("category", StringType, nullable = true),
+  StructField("store", StringType, nullable = true),
+  StructField("amount", DoubleType, nullable = false)
+))
+
+val rowRdd: RDD[Row] = sc.textFile("/workspace/data/dataset/salesData.csv").map {
+      case line =>
+        val attributes = line.split(",")
+        Row(attributes(0), attributes(1), attributes(2))
+      }
+
+val salesDf = spark.createDataFrame(rowRdd, schema) 
+salesDf.printSchema()
+// root
+// |-- category: string (nullable = true)
+// |-- store: string (nullable = true)
+// |-- amount: double (nullable = false)
+----
+====
+
+.DataFrame schema 
+To enable its powerful optimizations, Spark SQL operates on a well-defined, restricted set of data types. 
+A DataFrame's schema is built exclusively from these Spark SQL types, each of which has a direct mapping to a standard Scala type.
+This restricted set of types is what allows the Catalyst optimizer to understand the data's structure and generate efficient, specialized code for execution.
+
+The following table lists the basic primitive data types, which are the standard types you would find in most database systems.
+
+[header]
+|===
+| Scala Type      | SQL type          | Details
+
+| `Byte`          | `ByteType`        | 1 byte signed integers
+| `Short`         | `ShortType`       | 2 byte signed integers
+| `Int`           | `IntegerType`     | 4 byte signed integers
+| `Long`          | `LongType`        | 8 byte signed integers
+| `java.math.BigDecimal` | `DecimalType` | Arbitrary precision signed decimals
+| `Float`         | `FloatType`       | 4 byte floating point number
+| `Double`        | `DoubleType`      | 8 byte floating point number
+| `Array[Byte]`   | `BinaryType`      | `Byte` sequence values
+| `Boolean`       | `BooleanType`     | `true`/`false`
+| `java.sql.Timestamp` | `TimestampType` | `Date` containing y, m, d, h, m, s
+| `java.sql.Date` | `DateType`        | `Date` containing y, m, d
+| `String`        | `StringType`      | `Character` string values (UTF8)
+|===
+
+In addition to these primitive types, Spark SQL supports complex data types that let you build nested structures like arrays, maps, or other structs.
+
+[header]
+|===
+| Scala Type      | SQL type          
+
+| `Array[T]`      | `ArrayType(elementType, containsNull)` 
+| `Map[K, V]`     | `MapType(keyType, valueType, valueContainsNull)` 
+| `case class     | `StructType(List[StructFields])`
+|===
+
+[[exa:nested-datatypes]]
+====
+It's possible to arbitrarily nest complex data types.
+Consider the following `case class`es.
+
+[source, scala]
+----
+case class Account(
+  balance: Double,
+  employees: Array[Employee])
+
+case class Employee(
+  id: Int,
+  name: String,
+  jobTitle: String)
+
+case class Project(
+  title: String,
+  team: Array[Employee],
+  acct: Account)
+----
+
+The schema type of Scala type `Project`, which is associated with `Employee` and `Account`, can be represented as follows.
+
+[source, scala]
+----
+StructType(
+  StructField("title",StringType,true),
+  StructField(
+    "team",
+    ArrayType(
+      StructType(StructField("id",IntegerType,true),
+                 StructField("name",StringType,true),
+                 StructField("jobTitle",StringType,true),
+      true),
+    true),
+  StructField(
+    "acct",
+    StructType(
+      StructField("balance",DoubleType,true)
+      StructField(
+        "employees",
+        ArrayType(
+          StructType(StructField("id",IntegerType,true),
+                     StructField("name",StringType,true),
+                     StructField("jobTitle",StringType,true),
+        true),
+      true)
+    ),
+  true)
+)
+----
+====
+
+Manually defining a schema with `StructType` and `StructField` is powerful but verbose, and it's generally avoided when an easier method is available (i.e., when the schema is inferred).
+
+The most robust way to define a schema is to create a `case class` and let Spark automatically create the schema. This happens when you convert a local Seq or a distributed RDD of that case class type into a DataFrame (cf. `dfRef` in <<exa:dataframe-creation-RDD-inferred>>).
+
+A second powerful method is to let Spark infer the schema directly from the data source. 
+This works perfectly for semi-structured formats like JSON or self-describing binary formats like Parquet.
+These file formats already embed the schema.
+
+==== DataFrame creation from external (semi-)structured data
+Spark SQL can create DataFrames directly from a wide variety of external data sources. 
+This is the most common and efficient way to load external data.
+
+The `spark.read` interface provides built-in support for many formats, including:
+
+* Semi-structured files (e.g., JSON)
+* Structured text files (e.g., CSV)
+* Binary, columnar formats (e.g., Parquet, ORC)
+* Relational databases (via JDBC)
+
+For a full list of supported sources and their specific options, refer to the https://downloads.apache.org/spark/docs/{spark-version}/api/scala/org/apache/spark/sql/DataFrameReader.html[`org.apache.spark.sql.DataFrameReader`] API documentation.
+
+.DataFrame creation from semi-structured data with inferred schema.
+[[exa:dataframe-creation-semi-inferred]]
+====
+Suppose we have the following JSON data.
+Note that the `customer_id` field is missing from some records.
+
+[source, json]
+----
+{"category": "Electronics", "store": "Brussels", "amount": 1300.0}
+{"category": "Books", "store": "Ghent", "amount": 30.0, "customer_id": "c123"}
+{"category": "Groceries", "store": "Brussels", "amount": 45.0}
+{"category": "Electronics", "store": "Antwerp", "amount": 2000.0, "customer_id": "c456"}
+{"category": "Books", "store": "Brussels", "amount": 70.0}
+----
+
+Instead of manually defining a schema, we can use `spark.read.json()` to point Spark at the file. 
+Spark reads the file, scans the data to determine all available fields, and infers their types.
+
+[source, scala]
+----
+val salesDf = spark.read.json("/workspace/data/dataset/salesData.json")
+salesDf.printSchema()
+// root
+// |-- amount: double (nullable = true)
+// |-- category: string (nullable = true)
+// |-- customer_id: string (nullable = true)
+// |-- store: string (nullable = true)
+
+salesDf.show()
+// +------+-----------+-----------+--------+
+// |amount|   category|customer_id|   store|
+// +------+-----------+-----------+--------+
+// |1300.0|Electronics|       NULL|Brussels|
+// |  30.0|      Books|       c123|   Ghent|
+// |  45.0|  Groceries|       NULL|Brussels|
+// |2000.0|Electronics|       c456| Antwerp|
+// |  70.0|      Books|       NULL|Brussels|
+// +------+-----------+-----------+--------+
+
+----
+
+Spark correctly inferred all four columns (including `customer_id`) and their types. 
+For the records where `customer_id` was missing, it automatically filled in `null`, ensuring the final DataFrame has a consistent structure.
+====
+
+[[sec:dataframe-operations]]
+== Operations on DataFrames
+DataFrames expose a rich declarative API for data manipulation that, while similar in name to the imperative RDD API, operates at a much higher level of abstraction.
+Despite this fundamental difference, the execution model is the same. 
+Just as with RDDs, operations on DataFrames are divided into transformations and actions.
+The concepts of lazy evaluation (for transformations) and eager execution (for actions) are identical.
+
+=== A First Example
+[[exa:dataframe-first]]
+.First example of performing operations on DataFrames.
+====
+This code demonstrates a standard, chained query using the DataFrame API, which is equivalent to a `SQL SELECT...FROM...WHERE...ORDER BY` query.
+
+First, a DataFrame is created from the `salesData` list, and the columns are named `"category"`, `"store"`, and `"amount"`.
+Then a `select` transformation is used to project the DataFrame, keeping only the `"category"` and `"amount"` columns, discarding the `"store"` column.
+Next, a `filter` transformation filters the rows, keeping only those where the `"amount"` is greater than 100.
+This removes the `"Books"` and `"Groceries"` records.
+The final `orderBy` transformation sorts the remaining data by the `"amount"` column in descending order.
+
+The `show` action that triggers the execution of the entire lazy transformation chain.
+The result is printed to the console, showing the two `"Electronics"` records that matched the filter, sorted from highest to lowest amount.
+
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+
+val salesDf = salesData.toDF("category", "store", "amount")
+                        .select($"category", $"amount")
+                        .where($"amount" > 100)
+                        .orderBy($"amount".desc)
+
+salesDf.show()
+// +-----------+------+
+// |   category|amount|
+// +-----------+------+
+// |Electronics|2000.0|
+// |Electronics|1300.0|
+// +-----------+------+
+----
+====
+
+=== Transformations
+In DataFrames, transformations are lazy operations that manipulate the DataFrame and return a new DataFrame. 
+They don't execute any code.
+Instead, they just build a logical plan that will be optimized by the Catalyst optimizer.
+
+DataFrame transformations are high-level, declarative statements that Spark's Catalyst optimizer can analyze and reorder to create a highly efficient physical execution plan, something it cannot do for the "`black box`" code inside an RDD's transformations.
+
+==== Selection
+`select` is a core transformation used to project or choose a set of columns from a DataFrame.
+It returns a new DataFrame containing only the specified columns, and is conceptually identical to the `SELECT` clause in SQL.
+
+[source, scala]
+def select(col: String, cols: String*): DataFrame
+def select(cols: Column*): DataFrame
+
+As shown in the signatures, most DataFrame operations can be called in two ways, which define how you refer to your columns:
+
+. By `String` (`"colName"`): this is a simple, convenient syntax, typically used when you are just selecting or grouping by existing columns (e.g., `df.select("category", "store")`).
+
+. By `Column` object: this is the more powerful and expressive method used for building complex expressions. 
+It allows you to perform calculations (e.g., `$"amount" * 2`), apply functions (e.g., `lower($"category")`), or rename columns (e.g., `.as("new_name")`).
+
+.Creating Column objects
+While Column objects are declarative, the method you use to create them matters.
+There are two distinct ways to create a Column, and they behave differently in a `join`, for example.
+
+. *Unbound columns* using the `$`-notation (e.g., `$"amount"`), as used in the examples above.
+This is a concise shorthand that requires `import spark.implicits._`.
+This is a generic, '`unresolved`' or '`unbound`' column expression (it's just a name).
+When used in a `join` (`df1.join(df2, $"id")`), the Catalyst optimizer tries to find a column named `"id"` in the combined schema of `[df1, df2]`. 
+Since it finds two columns named `"id"`, it fails with an ambiguity error.
+
+. *Bound columns* using the DataFrame variable (e.g., `salesDf("amount")`).
+This is a more explicit way to get a `Column` from a specific DataFrame.
+It creates a Column expression that is internally qualified by Spark. 
+It's still a declarative object, but it '`remembers`' the specific DataFrame it came from.
+`join` expressions like `df1.join(df2, df1("id") === df2("id")` provide unambiguous, '`qualified`' columns.
+The optimizer knows exactly which `"id"` to use from which side.
+
+====
+The program below illustrates the creation of unbound `Column` object `roundedWithVAT`.
+It describes a computation that references column `"amount"` by its name. 
+The program then applies this single expression in a `select` operation, and Spark resolves it against the DataFrame's schema at runtime.
+
+[source, scala]
+----
+val roundedWithVAT = round($"amount" * 0.21)
+
+val salesData = List(
+  ("Electronics", 1300.0),
+  ("Books", 30.0),
+  ("Groceries", 45.0)
+)
+val salesDf = salesData.toDF("category", "amount")
+
+// completely unrelated data
+val equipmentData = List(
+  ("Linux server", 67382.23),
+  ("Server rack", 23462.99),
+  ("Cables", 9834.63)
+)
+val equipmentDf = equipmentData.toDF("name", "amount")
+
+salesDf.select(roundedWithVAT).show();
+// +-------------------------+
+// |round((amount * 0.21), 0)|
+// +-------------------------+
+// |                    273.0|
+// |                      6.0|
+// |                      9.0|
+// +-------------------------+
+
+equipmentDf.select(roundedWithVAT).show();
+// +-------------------------+
+// |round((amount * 0.21), 0)|
+// +-------------------------+
+// |                  14150.0|
+// |                   4927.0|
+// |                   2065.0|
+// +-------------------------+    
+----
+====
+
+A DataFrame is a dynamically-typed API, meaning the Scala compiler does not know your schema (it only knows that `$"amount"` and `salesDf("amount")` are both objects of type `Column`).
+An expression like `salesDf("amount") > 100` will compile successfully even if the `"amount"` column contains strings.
+The error will only be caught at runtime when you call an action. 
+
+==== Filtering
+`where` is a transformation that filters rows based on a given condition, returning a new Dataset containing only the elements that satisfy the predicate. 
+It is conceptually identical to the `WHERE` clause in SQL.
+
+[source, scala]
+def where(conditionExpr: String): DataFrame
+def where(condition: Column): DataFrame
+
+`where` is a direct alias for `filter`, and they can be used interchangeably.
+
+==== Sorting
+`orderBy` is a wide transformation that performs a _global_ sort on the entire DataFrame, returning a new, sorted DataFrame.
+
+[source, scala]
+def orderBy(sortCol: String, sortCols: String*): DataFrame
+def orderBy(sortExprs: Column*): DataFrame
+
+This operation is an alias for the `sort` function, and they can be used interchangeably.
+
+====
+The following example program shows a sort on two columns.
+It first sorts the sales data by `"category"` (alphabetically) and then by `"amount"` (from highest to lowest).
+
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+val salesDf = salesData.toDF("category", "store", "amount")
+
+val sortedDf = salesDf.orderBy($"category".asc, $"amount".desc).show()
+// +-----------+--------+------+
+// |   category|   store|amount|
+// +-----------+--------+------+
+// |      Books|Brussels|  70.0|
+// |      Books|   Ghent|  30.0|
+// |Electronics| Antwerp|2000.0|
+// |Electronics|Brussels|1300.0|
+// |  Groceries|Brussels|  45.0|
+// +-----------+--------+------+    
+----
+====
+
+==== Grouping and Aggregation
+For grouping and aggregating, Spark SQL provides a `groupBy` function.
+However, this does not return a DataFrame, but an intermediate object called a `RelationalGroupedDataset`.
+
+[source, scala]
+def groupBy(cols: Column*): RelationalGroupedDataset
+def groupBy(col1: String, cols: String*): RelationalGroupedDataset
+
+A `RelationalGroupedDataset` is not a complete, distributed DataFrame, and should never be directly instantiated by programs. 
+It represents a _logical_ grouping definition, not a tangible set of records yet.
+You therefore cannot chain another `filter` or `select` after a `groupBy` for example.
+Instead you must call one of the several standard aggregation functions defined on `RelationalGroupedDataset` like `count`, `sum`, `max`, `min`, `mean` and `avg`, which do return a DataFrame.
+
+This design pattern allows more logical composition and aligns with SQL.
+`RelationalGroupedDataset` is the direct implementation of <<sec:dataframes-sql,SQL>> `GROUP BY` semantics.
+A `GROUP BY` clause by itself is not a valid query: it requires an aggregate function (like `COUNT(*)` or `AVG(...)`) to produce a result. 
+Additionally, it allows for better <<sec:dataframe-groupby-performance,optimization>>: instead of immediately performing a potentially expensive physical grouping (involving lots of shuffling), Spark '`waits`' to see what happens with the groups.
+
+`agg` is the most powerful and flexible aggregation method available on `RelationalGroupedDataset`.
+You pass it one or more aggregate Column expressions, and it returns a new DataFrame containing the `groupBy` columns and all the aggregation results.
+
+[source, scala]
+def agg(expr: Column, exprs: Column*): DataFrame
+
+While `sum`, `count`, and `avg` are convenience shortcuts on `RelationalGroupedDataset` that compute one specific aggregation, you must use `agg` if you want to perform multiple aggregations on the same grouped data (e.g., get the `sum` and the `avg`).
+
+====
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+val salesDf = salesData.toDF("category", "store", "amount")
+
+val groupedData = salesDf.groupBy("store")
+
+val summaryDf = groupedData.agg(
+  sum("amount").as("total_sales"),
+  round(avg("amount")).as("average_sales"),
+  count("*").as("number_of_sales")
+).show()
+// +--------+-----------+-------------+---------------+
+// |   store|total_sales|average_sales|number_of_sales|
+// +--------+-----------+-------------+---------------+
+// |Brussels|     1415.0|        472.0|              3|
+// |   Ghent|       30.0|         30.0|              1|
+// | Antwerp|     2000.0|       2000.0|              1|
+// +--------+-----------+-------------+---------------+    
+----
+====
+
+[[sec:dataframe-groupby-performance]]
+.Performance considerations of `groupBy` vs. `groupByKey`
+Using RDDs, it is a bad idea to first do a `groupByKey`, returning an RDD of type (K, Iterable[V]), and then reduce all the collections for each key, for example by doing `salesRdd.groupByKey().mapValues(_.sum)`.
+The materialized collection of values for a given key must be able to fit into the memory of the worker node containing that key.
+Additionally, `groupByKey` can be a very expensive operation if a shuffle is required to co-locate keys.
+We explained that `salesRdd.reduceByKey(_ + _)` is the prefered way of achieving the same behavior because this uses map-side combine before shuffling.
+
+This is not a concern when using the DataFrame API, however, as Spark SQL's Catalyst optimizer automatically handles this optimization.
+We can first `groupBy` and then reduce, and Catalyst will optimize to avoid materializing any intermediate collections when it is not necessary.
+With DataFrames, we therefore can write our example as `salesDf.groupBy($"store").sum("amount")`.
+
+==== Joins
+Joins on DataFrames are similar to those on Pair RDDs, with the one major usage difference that, since DataFrames aren't key-value pairs but rows in a database tables, the columns to join on must be explictly specified.
+
+[source, scala]
+def join(right: DataFrame, joinExprs: Column, joinType: String): DataFrame
+
+`join` is the most general join transformation.
+It combines two DataFrames based on a join condition.
+
+`joinExprs` is a `Column` expression that defines the logic, such as `demographicsDf("id") === financesDf("id")`.
+When the `joinExpr` is not specified, the join becomes a `"cross"` join, which is cartesian join.
+
+
+`joinType` is a string specifying the join type. 
+The default is `"inner"`, but you can also specify `"left_outer"`, `"right_outer"`, `"cross"`, etc.
+
+The <<exa:students-cartesian-solution,solution>> in the motivating example that first performed the cartesian product on two RDDs and then filtered was by far the worst performing solution. 
+However, as with other transformations we have discussed, Catalyst will optimize a cross-join followed by a filter into a much more efficient inner-join that completely avoids constructing an expensive Cartesian product.
+For example, 
+
+[source, scala]
+demographicsDf.join(financesDf).where(demographicsDf("id") === financesDf("id"))
+
+then becomes 
+
+[source, scala]
+demographicsDf.join(financesDf, demographicsDf("id") === financesDf("id"))
+
+=== Dataframe Actions
+In DataFrames, actions are operations that trigger the execution of the full logical plan. 
+They are used to retrieve a result or write data to an external sink.
+We already encountered many of these actions (also in the context of RDDs), so we just list these and some others with a brief explanation for reference.
+
+[source, scala]
+def show(): Unit
+def show(numRows: Int): Unit
+
+Displays the top `numRows` (default 20) of a DataFrame in a tabular form.
+Strings more than 20 characters will be truncated, and all cells will be aligned right.
+`show` is the equivalent of `take` followed by printing.
+
+[source, scala]
+def printSchema: Unit
+
+Prints the schema to the console using a tree format.
+
+[source, scala]
+def collect(): Array[Row]
+
+Returns an array that contains all the rows in a DataFrame.
+
+[source, scala]
+def count(): Long
+
+Returns the number of rows in the DataFrame.
+
+[source, scala]
+def first(): Row
+
+Returns the first row.
+
+[source, scala]
+def take(n: Int): Array[Row]
+
+Returns the first `n` rows in the DataFrame.
+
+[source, scala]
+def foreach(f: (Row) => Unit): Unit
+
+\Applies a function `f` to all rows.
+
+[source, scala]
+def reduce(func: (Row, Row) => Row): Row
+
+Reduces the elements of a DataFrame using the specified binary function.
+
+[[sec:motivational-example-revisited]]
+== Back to motivational example 
+Let's revisit the <<sec:motivational-example-revisited, scholarship candidate problem>>. 
+The goal is to find the number of potential candidates who meet three specific criteria: they are from Belgium, have financial debt and financial dependents.
+To find this, we must query our two data sources, one containing demographic information and the other containing financial information, which are linked by a common `"id"`.
+
+[source, scala]
+----
+val result = demographicsDf.join(financesDf, demographicsDf("id") === financesDf("id"))
+              .filter($"hasDebt" && $"hasFinancialDependents")
+              .filter($"country" === "Belgium")
+              .count()
+----
+
+The required logic can be implemented using DataFrames in a '`natural`' or intuitive style, similar to our first RDD solution: we define the `join` first, and then apply the `filter` operations.
+Despite its simple, join-before-filter structure, this DataFrame solution is still faster than all previous RDD solutions (see <<fig:performance-dataframes>>). 
+
+[[fig:performance-dataframes]]
+image::performance-dataframes.png[]
+
+It is even faster than our manually-optimized RDD solution 2, because Catalyst has more optimization opportunities, like only loading the columns (object fields) that are not relevant to the query.
+Addionally, Tungsten can generate much more efficient RDDs.
+
+We now can write something that looks like the first solution but has the performance of the second solution, which is what we wanted.
+This is the fundamental advantage of the declarative API: we specified _what_ we wanted (the final count) but not the exact _how_ to compute it. 
+Spark's Catalyst optimizer was able to analyze this logical plan and automatically rewrote it into a more efficient physical plan.
+
+[[sec:catalyst]]
+== Catalyst and Tungsten Optimizer
+The DataFrame API often much faster than the RDD API, even when both ultimately run on the same Spark core.
+This is because of the Catalyst and Tungsten optimizer.
+
+=== Catalyst
+The DataFrame API, in contrast to the imperative RDD API, is declarative. 
+A query like `df.filter($"age" > 21).select($"name")` is not a "`black box`" of code like a lambda, but it's a logical plan (an abstract syntax tree, if you want) that Catalyst can analyze, understand, and rewrite.
+
+Catalyst is a sophisticated query optimizer that applies techniques from the database world. 
+It analyzes your logical plan, along with metadata about the data (e.g., schema, file formats, statistics), and generates multiple potential physical execution plans.
+It then uses a cost-based model to select the most efficient one (<<fig:spark-sql-pipeline>>).
+
+[[fig:spark-sql-pipeline]]
+.Spark SQL pipeline <<catalyst>>.
+image::spark-sql-pipeline.png[]
+
+Catalyst, with its full understanding of the data schema and computations' structure, can perform the following powerful optimizations:
+
+* Filter early (a.k.a '`predicate pushdown`', or '`operation reordering`'): Catalyst automatically pushes `filter` operations as close to the data source as possible.
+This ensures expensive operations, like a `join`, are performed on the smallest amount of data, not the other way around.
+
+* Column pruning: Catalyst analyzes your query (e.g., `select($"name")`) and will modify the data-reading step to load only the `"name"` column from the source file.
+This dramatically reduces I/O. 
+An RDD, in contrast, would have to load an entire object (like an Account) into memory, even if you only use one field.
+
+* Partition pruning: Catalyst analyzes `filter` conditions to determine if entire data partitions can be skipped.
+For example, if data is partitioned by date, a `filter` on `date = '2025-11-05'` will cause Spark to read only the partition for that specific date.
+
+=== Tungsten
+Tungsten's optimizations are applied automatically when you use DataFrames or Spark SQL. 
+Tungsten's performance improvements are based on mechanisms such as off-heap memory management to avoid the JVM object creation and garbage collection, cache-aware binary processing, and whole-stage code generation that is JIT-compiled into JVM bytecode.
+
+Although low-level RDD code and high-level DataFrames (i.e., Tungsten-optimized RDDs) can be mixed, this comes at a significant performance penalty (in addition to Catalyst no longer being able to optimize opaque RDD operations).
+It introduces serialization/deserialization boundaries between regular RDDs (plain heap-allocated JVM objects) and Tungsten RDDs (off-heap optimized binary data representations), combined with breaking the whole-stage code generation pipeline that prevents the fusion of  operations into a single, optimized bytecode function.
+
+A more detailed discussion of these optimizations is beyond the scope of this course.
+
+[[sec:dataframes-sql]]
+== SQL
+It is also possible to describe operations on DataFrames using SQL commands specified in actual SQL syntax.
+This can be achieved through the `sql` method.
+
+[source, scala]
+def sql(sqlText: String): DataFrame
+
+This method takes a standard SQL query string.
+To make DataFrames queryable as SQL tables inside SQL query strings within a `SparkSession`, the method `createOrReplaceTempView` must be used.
+
+[source, scala]
+def createOrReplaceTempView(viewName: String): Unit
+
+====
+The example below is equivalent to <<exa:dataframe-first>>, which was the first introduction to performing operations on a DataFrame.
+It demonstrates a straightforward query that shows a DataFrame with a different schema than the input DataFrame.
+
+[source, scala]
+----
+    val salesData = List(
+      ("Electronics", "Brussels", 1300.0),
+      ("Books", "Ghent", 30.0),
+      ("Groceries", "Brussels", 45.0),
+      ("Electronics", "Antwerp", 2000.0),
+      ("Books", "Brussels", 70.0)
+    )
+
+    val salesDataDf = salesData.toDF("category", "store", "amount")
+    
+    salesDataDf.createOrReplaceTempView("sales")
+
+    val salesDf = spark.sql("""
+      SELECT category, amount
+      FROM sales
+      WHERE amount > 100
+      ORDER BY amount DESC      
+    """)
+
+    salesDf.show()
+    // +-----------+------+
+    // |   category|amount|
+    // +-----------+------+
+    // |Electronics|2000.0|
+    // |Electronics|1300.0|
+    // +-----------+------+
+----
+====
+
+
+====
+The example below is equivalent to <<sec:motivational-example-revisited>> that used the DataFrame API for expressing the query for our motivational example.
+
+[source, scala]
+----
+demographicsDf.createOrReplaceTempView("demographics")
+financesDf.createOrReplaceTempView("finances")
+
+val resultDf = spark.sql("""
+    SELECT COUNT(*)
+    FROM demographics d
+    JOIN finances f ON d.id = f.id
+    WHERE 
+        f.hasDebt AND 
+        f.hasFinancialDependents AND
+        d.country = 'Belgium'
+    """)
+
+val result = resultDf.first().getLong(0);
+----
+
+We write a query that performs the same `JOIN` and `WHERE` (filter) logic as the DataFrame API.
+
+`SELECT COUNT(*)` performs the aggregation directly within the SQL query, equivalent to the `count` action in the original example.
+The result of a `SELECT COUNT(*)` query is a DataFrame with one row and one column.
+We call `first` to get that single row, and `getLong(0)`` to extract the `Long` value from its first column (with index 0).
+====
+
+Spark SQL's syntax support is broad and can be configured to operate in a strict or in a more permissive dialect.
+Spark uses the strict ANSI SQL-compliant dialect as the default, aligning Spark's behavior with traditional relational databases.
+
+Being a strict dialect, this provides greater data integrity and more predictable behavior.
+Key characteristics include strict runtime errors (invalid operations like division by zero throw a runtime exception instead of returning `NULL`), strict type coercion (unreasonable conversions like casting a `String` to an `Int` are disallowed), and a stricter set of SQL keywords (like `ALL`, `AND`, `AS`) that are reserved and cannot be used as identifiers (e.g., for column names) without quotes.
+
+Regardless of the dialect, Spark SQL supports the vast majority of standard SQL syntax you would expect from a modern data processing framework:
+
+* Query constructs: `SELECT`, `DISTINCT`, `WHERE`, `HAVING`, `LIMIT`, `JOIN` (all types), `GROUP BY`, `ORDER BY`, `SORT BY`
+
+* Subqueries: `SELECT col FROM (SELECT ... AS ... FROM ...)`
+
+* Data manipulation: `INSERT`, `UPDATE`, `DELETE`, `MERGE`
+
+* Data definition: `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE VIEW`
+
+* Window functions (`OVER`), aggregations (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, ...), and a large built-in function library for strings, dates, math, ...
+
+While using raw SQL strings is a powerful feature, the DataFrame API in Scala is often a better choice for building complex applications.
+It is more expressive because it allows you to programmatically compose and build queries in a step-by-step, functional manner.
+This approach is also less error-prone than using `sql` because of compiler validation (you cannot "`miss a comma`" somewhere in the middle of a long query), easier to maintain, and easier to debug (`printSchema`, `show`, ...).
+
+== Limitations of DataFrames
+While the declarative nature of DataFrames provides significant performance and ease-of-use benefits, this abstraction is not without its trade-offs, as we have already established. 
+We repeat 2 important drawbacks here.
+
+First, DataFrames are not statically typed.
+The compiler doesn't know the specific column names or types within a DataFrame.
+For example, it cannot statically type-check operations like `messagesDf.select($"hasTags")`, so typos in column names may result in errors like
+
+  Exception in thread "main"
+  AnalysisException: No such struct field hasTags in hashTags, symbols, urls, user_mentions;
+
+Type errors are only caught at run time. 
+With Spark RDDs you will receiving this type of information already at compile time.
+
+Second, DataFrames require structured or semi-structured data, meaning that all of your data types have to be expressible within a DataFrame schema.
+If your unstructured data cannot easily be reformulated to adhere to some kind of schema, it is better to use RDDs.
+
+== Datasets
+DataFrames are not statically typed.
+To see why this is not always ideal, consider <<exa:motivational-ds>>.
+
+[[exa:motivational-ds]]
+====
+Assume we have to calculate the average sales amount per store.
+The program below compiles just fine, but contains a mistake.
+Instead of selecting the value of column 1 of each generic row of `averageSalesDf`, the program wrongfully selects column 0, which has type String.
+The result is that the program tries to cast a String to a Double, which results in a runtime error.
+
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+
+val salesDf = salesData.toDF("category", "store", "amount")
+val averageSalesDf = salesDf.groupBy($"store").avg("amount")
+// +--------+-----------------+
+// |   store|      avg(amount)|
+// +--------+-----------------+
+// |Brussels|471.6666666666667|
+// |   Ghent|             30.0|
+// | Antwerp|           2000.0|
+// +--------+-----------------+
+
+val mapped = averageSalesDf.map { row =>
+  try {
+    // wrong column index, so casting String to Double
+    val avgAmount: Double = row.getDouble(0)
+    s"Average amount: EUR ${avgAmount.round}"
+  } catch {
+    case e: Exception => s"Error: ${e.getMessage}"
+    // Error: class java.lang.String cannot be cast to class java.lang.Double
+  }
+}
+
+mapped.collect().foreach(println)
+----
+====
+
+Every time we move from the DataFrame world into the Scala world we have to cast, because the values from a Row are of static type `Any`.
+
+Even if in the example the right column (index 1) would be selected, the code with the cast would still not be ideal: we have to specify the same, matching type information, which feels redundant and makes the code fragile (what if the schema evolves?).
+
+[[exa:dataframe-row-interaction]]
+====
+The code below shows an example interaction with a `Row`.
+Generic access based on index returns objects (primitive values are boxed) of static type `Any`.
+
+// TODO: introduce Row type more properly in DataFrame part
+[source, scala]
+----
+val row = Row(1, true, "a string", null)
+
+val firstValue = row(0)
+// firstValue: Any = 1
+
+val fourthValue = row(3)
+// fourthValue: Any = null
+
+val firstValue = row.getInt(0)
+// firstValue: Int = 1
+val isNull = row.isNullAt(3)
+// isNull: Boolean = true
+----
+====
+
+The code in <<exa:motivational-ds>> would be much cleaner and safer if it were possible to work with some kind of _statically-typed_ DataFrame. 
+This would allow the Scala compiler to catch type-based errors, such as using the wrong index or casting to the wrong type.
+
+Spark provides this capability through the Dataset API.
+Datasets are not a '`variant`' of DataFrames: in reality, it's the other way around.
+In Scala, a DataFrame is not its own class but simply a type alias for `Dataset[Row]`.
+
+[source, scala]
+type DataFrame = Dataset[Row]
+
+This means that Spark's structured API really only has _one_ core abstraction: the Dataset. 
+The difference is in the type parameter:
+
+* A DataFrame (`Dataset[Row]`) is a Dataset where the element type is a generic, dynamically-typed `Row` object.
+The DataFrame API is familiar to users of dynamicaly typed languages (e.g., Python).
+The compiler has no knowledge of the internal structure and types that make up a row of data (a record) and operations on it, so operations are not statically type-safe.
+However, Spark _does_ have this information (the schema together with declarative operations) and uses it  to highly optimize DataFrames.
+
+* A Dataset of type `T` (e.g., `Dataset[Sale]`) is a Dataset of statically-typed Scala `case class` objects.
+The compiler knows the structure and types of records involved, enabling static type checking.
+This is more familiar for Scala and Java users.
+
+DataFrames and Datasets share the same underlying engines (Catalyst and Tungsten) and the same declarative, dynamically-typed (Column-based) API (`select`, `filter`, `join`, ...).
+However, Datasets also provides access to the RDD-like, statically type-safe functional API (e.g., `map`, lambda-based `filter`, `groupByKey`), which is what provides the compile-time safety we wanted.
+However, Scala code within a typed function that is safe at compile-time is a black box to the optimizer, so this disables key optimizations.
+// Even when using opaque lambdas, Datasets use Encoders for serialization. 
+// This is still significantly faster and more memory-efficient than RDDs, which rely on generic Java/Kryo serialization.
+
+In a way, Datasets unify the DataFrame and RDD APIs: a Dataset of type `T` conceptually corresponds to an RDD of type `T` and a schema.
+Datasets require structured or semi-structured data because of the schema that imposes this structure.
+It is therefore not always possible to just transform any type of RDD into a Dataset.
+
+=== Creating a Dataset
+Similar to a DataFrame, you can create a Dataset from a Scala collection, from an RDD, and from an existing DataFrame.
+The first two cases rely on the `toDS` method, and the type of Dataset is automatically inferred.
+The third case relies on a dynamic cast to bring the dynamically typed DataFrame into the statically typed world.
+Casting transforms the generic `Row` type into the actual element type.
+
+[[exa:dataset-creation]]
+====
+The following code illustrates the three methods of creating a Dataset.
+All three result in the same schema and Dataset.
+
+[source, scala]
+----
+val salesData  = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+
+// from collection
+val salesCollection: Seq[Sale] = salesData.map {
+  case (category, store, amount) => Sale(category, store, amount)
+}
+val dsFromCollection: Dataset[Sale] = salesCollection.toDS()
+
+// from RDD
+val salesRdd: RDD[Sale] = sc.parallelize(salesCollection)
+val dsFromRdd: Dataset[Sale] = salesRdd.toDS()
+
+// from DataFrame
+val salesDf = salesData.toDF("category", "store", "amount")
+val dsFromDf: Dataset[Sale] = salesDf.as[Sale]
+----
+====
+
+=== Operations on Datasets
+
+==== Transformations on Datasets
+Because DataFrame and Dataset share the same code base, and a DataFrame is just a Dataset, all operations on a DataFrame are also available on a Dataset, but they are dynamically typed.
+In addition, a Dataset also defines statically typed variants of many DataFrame transformations, and additional transformations such as RDD-like higher-order functions `map`, `flatMap`, etc.
+As a result, the Dataset API includes both dynamically and statically typed transformations.
+
+The statically and dynamically typed APIs are integrated. 
+You can call `map` on a DataFrame and get back a Dataset, for example.
+Both APIs can be mixed and matched.
+However, remember that any dynamically typed transformation will lose all static type information in the Dataset (but not the dynamic type information of the schema, since both DataFrames and Datasets have a schema).
+
+// TODO: integrate exa-ds-transformations (already on slide)
+
+=== Grouping and Aggregation
+`groupByKey` is the statically-typed method for grouping data in Datasets.
+
+[source, scala]
+def groupByKey[K](func: (T) => K): KeyValueGroupedDataset[K, T]
+
+It returns a `KeyValueGroupedDataset` that logically groups the data by the given function, which transforms elements of type `T` (the type of elements in the Dataset) into a key of type `K`.
+Since a Dataset is statically typed, we can specify a function for obtaining the key instead of having to provide a `Column` as was the case with DataFrames.
+
+.General aggregation
+Similar to `RelationalGroupedDataset` that results from the dynamically typed `groupBy`, `KeyValueGroupedDataset` is an intermediate '`waiting`' object, with the most common operation being  `agg` for declarative aggregations.
+
+[source, scala]
+def agg[U](col1: TypedColumn[V, U]): Dataset[(K, U)]
+
+This is the dynamically typed `agg` from DataFrames, but it requires a `TypedColumn`.
+Computes the given aggregation, returning a Dataset of tuples for each unique key and the result of computing this aggregation over all elements in the group.
+A typed column which can be obtained by calling `as` on a `Column`.
+
+[source, scala]
+def as[U]: TypedColumn[Any, U]
+
+[[exa:dataset-agg]]
+====
+The code below illustrates that the static types of both the key (`String`) and result (`Double`) are preserved.
+
+[source,scala]
+----
+val salesDs: Dataset[Sale] = salesData.toDS();
+val totalSalesDs: Dataset[(String, Double)] = salesDs
+      .groupByKey(_.store)
+      .agg(sum($"amount").as[Double])
+----
+====
+
+The argument for using Datasets for their type safety is weakened by this hybrid approach for aggregations requiring dynamic type-casting using `as`.
+However, this is a pragmatic trade-off.
+_Typed_ aggregation functions (like `typed.avg`) were deprecated in order to have one single, highly-optimized aggregation pathway using the dynamically-typed aggregation functions recognized by Catalyst.
+This avoided maintaining two parallel and complex aggregation APIs by Spark developers.
+
+However, the argument for using Datasets w.r.t. static type-safety remains very convincing for all transformations that are not aggregations, which is often where the most complex and error-prone business logic resides.
+For example, with a DataFrame , a `map` operation is not type-safe because the compiler cannot validate column names or types. 
+A simple typo will compile successfully but will cause a runtime exception.
+
+[source, scala]
+----
+// Compiles, but will fail at runtime due to typo "amont"
+val dfResult = salesDf.map { row => 
+  row.getAs[Double]("amont") * 1.2 
+}
+----
+
+With a `Dataset[Sale]`, the compiler knows the schema.
+The `map` function is type-safe, and the same typo (`sale.amont`) is caught immediately, before you ever run the code.
+
+.Processing grouped values
+Besides `agg` and shortcut functions such as `count`, `KeyValueGroupedDataset` also provides general-purpose, type-safe methods for processing an entire _group_ of values.
+This functional, RDD-like control over the grouped data is a key difference from the DataFrame API, where `groupBy` is almost exclusively followed by `agg`.
+
+Processing grouped data is not available on `RelationalGroupedDataset` in the DataFrame world for a couple of reasons.
+First, without a specific static type, interacting with generic Rows inside a lambda function defeats the purpose of a safe, typed API that Datasets aim to offer.
+Casting generic Rows to Scala objects is also much less efficient than deserializing binary rows into  objects using Datasets, which can be optimized because of the static typing.
+Second, the design of Spark in general aims to guarantee high performance for relational DataFrames.
+DataFrames therefore restrict the set of aggregation functions to those that allow aggressive optimizations (primarily map-side combine).
+When using statically-typed aggregation in the Dataset world, Spark cannot '`look into`' user-provided functions for optimization, so it must conservatively shuffle data anyway for operations such as `mapGroups`, meaning that offering these operations comes at no extra cost (which is very high).
+See <<sec:dataset-reduce-by-key>> for an illustration of this.
+
+The following transformations on `RelationalGroupedDataset` process grouped values.
+
+[source, scala]
+def mapValues[W](f: (V) => W): KeyValueGroupedDataset[K, W]
+
+Returns a new `KeyValueGroupedDataset` where the given function `f` has been applied to the data.
+It is a narrow transformation and therefore does not require shuffling.
+
+[source, scala]
+def mapGroups[U](f: (K, Iterator[V]) => U): Dataset[U]
+def flatMapGroups[U](f: (K, Iterator[V]) => IterableOnce[U]): Dataset[U]
+
+Apply the given function to each group of data.
+It provides your function with the key (of type `K`) and a full `Iterator` of all values (of type `V`) for that group. 
+The function can return an element (`mapGroups`) or collection of elements (`flatMapGroups`) of arbitrary type, which will be returned as (`mapGroups`) or spliced into (`flatMapGroups`) a new Dataset of that type.
+These are the most flexible operations, but highly inefficient since they require a full shuffle.
+// If an application intends to perform an aggregation over each key, it is best to use the reduce function or an org.apache.spark.sql.expressions#Aggregator.
+
+[source, scala]
+def reduceGroups(f: (V, V) => V): Dataset[(K, V)]
+
+Reduces the elements of each group of data using the specified binary function.
+The given function must be commutative and associative or the result is non-deterministic.
+Similar to `mapGroups`, but returns a Pair Dataset.
+
+[[sec:dataset-reduce-by-key]]
+.Reducing by key
+`reduceByKey` is a single transformation in the RDD API that did both grouping and reducing at once. 
+There is no `reduceByKey` method on a Dataset, however.
+Instead, the Dataset API uses the more composable, two-step pattern using `KeyValueGroupedDataset` as intermediate object to achieve the same result:
+
+. `groupByKey` defines the grouping.
+. `reduceGroups` performs the aggregation.
+
+[[exa:group-reduce]]
+====
+[source, scala]
+----
+case class Sale(category: String, amount: Double)
+
+// RDD API: 
+val salesRdd: RDD[(String, Int)] = ...
+val totalSalesRDD = salesRdd.reduceByKey(_ + _)
+
+// Dataset API:
+val salesDs: Dataset[Sale] = ... 
+
+val totalSalesDs: Dataset[(String, Sale)] = salesDs
+                  .groupByKey(sale => sale.category)  // group (type-safe)
+                  .reduceGroups { (sale1, sale2) =>   // reduce (type-safe)
+                    Sale(sale1.category, sale1.amount + sale2.amount)
+                    }
+----
+====
+
+While the approach in <<exa:group-reduce >> is fully type-safe at compile time, it is often more verbose than the declarative alternative.
+While `reduceGroups` exists, Spark encourages using the declarative, dynamically-typed aggregation functions. 
+This approach allows the Catalyst optimizer to have the most freedom to generate an efficient plan, because it cannot optimize type-safe operations requiring Scala lambda functions.
+
+<<exa:groupby-agg>> demonstrates the most common and practical '`modern`' equivalent of `reduceByKey`.
+
+// code below also in exa:group-reduce
+[[exa:groupby-agg]]
+====
+[source, scala]
+----
+val totalSalesDF = salesDs
+  .groupBy("category") // not statically type-safe
+  .agg(sum("amount"))
+----
+====
+
+== Back to motivational example
+For completeness, let's revisit the <<exa:motivational-ds, motivational example>> again and calculate the average sales amount per store, but this time using Datasets.
+
+[[exa:motivational-with-ds]]
+====
+The Dataset version of the motivational example uses statically-typed lambda functions, which are checked by the Scala compiler.
+The code below first defines a case class that represent the schema of the data.
+Then, a `Dataset[Sale]` is created, followed by declarative but dynamically-typed aggregation using `agg`.
+
+[source, scala]
+----
+val salesData = List(
+  ("Electronics", "Brussels", 1300.0),
+  ("Books", "Ghent", 30.0),
+  ("Groceries", "Brussels", 45.0),
+  ("Electronics", "Antwerp", 2000.0),
+  ("Books", "Brussels", 70.0)
+)
+
+val salesDs: Dataset[Sale] = salesData.toDF("category", "store", "amount").as[Sale]
+
+val averageSalesDs: Dataset[(String, Double)] = 
+  salesDs.groupByKey(_.store)
+          .agg(avg("amount").as[Double])
+
+val mapped = averageSalesDs.map { 
+    case (store: String, avgAmount: Double) => s"Average amount: EUR ${avgAmount.round}"
+}
+
+mapped.collect().foreach(println)
+----
+====
+
+
+// === Aggregators TODO
+// A class that helps you generically aggregate data. 
+// Kind of like the aggregate method we saw on RDDs.
+
+// class Aggregator[-IN, BUF, OUT]
+
+// val myAgg = new Aggregator[IN, BUF, OUT] {
+// def zero: BUF = ... (initial value)
+// def reduce(b: BUF, a: IN): BUF = ... (add new element to running total)
+// def merge(b1 : BUF, b2: BUF): BUF = ... (merge two subresults)
+// def finish(b: BUF): OUT = ... (return the final result)
+// }
+
+// (example)
+
+
+
+
+// === Encoders
+// Encoders are what convert your data between JVM objects and Spark SQL's
+// specialized internal representation. They're required by all Datasets!
+
+// Two ways to introduce encoders:
+// . Automatically (generally the case) via implicits from a SparkSession.
+// import ss.implicits._
+// . Explicitly via org.apache.spark.sql.Encoders, which contains a large
+// selection of methods for creating Encoders from Scala primitive types and
+// Products.
+
+// Missing RDD Methods
+// It is important to note that neither DataFrames nor Datasets include the full RDD API. 
+// For example, the reduceByKey transformation does not exist. 
+// The equivalent, structured-aware operations on a Dataset are groupByKey(...).reduceGroups(...) or using the groupBy(...).agg(...) functions.
+
+// TODO clean up
+== RDDs vs. DataFrames vs. Datasets
+When to use Datasets vs DataFrames vs RDDs?
+
+Use Datasets when:
+* You have structured or semi-structured data
+* You want compile-time type-safety
+* You want to work with functional APls
+* You need decent performance (but maybe not the best)
+
+Use DataFrames when:
+* You have structured or semi-structured data
+* You want the best possible performance, automatically optimized for you
+
+Use RDDs when:
+* You have unstructured data
+* You need to fine-tune and manage low-level details of RDD computations
+* You have complex data types that cannot be serialized with Encoders
+
+''''
+
+== Exercises
+
+=== Preliminaries
+
+For the exercises, we'll use the `wiki-logs-full` dataset, unless mentioned otherwise.
+Recall that each line of the log contains a record in the following format:
+
+  language pageName accessCount contentSize
+
+=== Exercise 1: DataFrame Loading and Querying
+
+Perform the following steps:
+
+. Load the data file using `SparkSession` in a DataFrame.
+Consult the documentation on https://spark.apache.org/docs/{spark-version}/api/scala/org/apache/spark/sql/DataFrameReader.html[`DataFrameReader`].
+You can use `option("delimiter", " ")` to split each line on the space character.
+
+. Make sure that the schema you loaded is correct. 
+You should see the following output when using `printSchema`:
+
+  root
+  |-- language: string (nullable = true)
+  |-- name: string (nullable = true)
+  |-- accesses: long (nullable = true)
+  |-- size: long (nullable = true)
+
+HINT: Have a look at the https://downloads.apache.org/spark/docs/{spark-version}/api/scala/org/apache/spark/sql/DataFrameReader.html#schema(schemaString:String):DataFrameReader.this.type[`schema(schemaString: String)` method] for a straightforward way of defining and applying a schema.
+
+. Write a program that calculates how many pages are in English (i.e., how many entries have the language
+"en"), first using the DataFrame API, and then using an SQL query string.
+Expected result:
+
+  1871290 pages in English (DataFrame API)
+  1871290 pages in English (query string)
+
+. Load the same data in a classic RDD (do not convert the DataFrame), and again count the number of English pages.
+
+  1871290 pages in English (RDD)
+
+=== Exercise 2: DataFrame Grouping
+
+For each of the following, query the DataFrame using both the DataFrame API and SQL query strings.
+
+. Return the size of the heaviest page.
+
+  max size     141180155987
+  max size sql 141180155987
+
+. Return the record representing the largest page.
+
+  max size page     [en.mw,en,5466346,141180155987]
+  max size page sql [en.mw,en,5466346,141180155987]
+
+. Return the page with the most number of accesses.
+
+  max access page name     en
+  max access page name sql en
+
+. Return the language with the most number of total accesses.
+
+  max lang total accesses     en.mw
+  max lang total accesses sql en.mw
+
+=== Exercise 3: DataFrame Joining
+Also load the `wiki-logs-full-2` dataset in a DataFrame. 
+Its format is the same than `wiki-logs-full` but the file contains data from another period.
+
+. Write a query that returns for each page in Italian (`"it"`) the sum of the accesses in the two periods.
+
+. Write a query that returns the page with the most number of accesses in total between the two datasets.
+
+// . How would you implement the same with RDDs?
+
+=== Exercise 4: Grouping and Aggregation
+The `events.csv` dataset contains data structured as follows:
+
+  organizer name budget
+
+You want to find out the ranking of these organizers based on their activity and spending. 
+Write a query that reads the csv file and orders the organizers, first based on the number of events they have organized, and second by the rounded average budget of their events.
+
+Your output should be the following table, with the same column names.
+
+  +---------+----------------+--------------------+
+  |organizer|number_of_events|avg_budget_per_event|
+  +---------+----------------+--------------------+
+  |     Org1|              41|              2337.0|
+  |     Org2|              41|               866.0|
+  |     Org3|              40|              2664.0|
+  |     Org4|              39|               722.0|
+  |     Org5|              39|               269.0|
+  +---------+----------------+--------------------+
+
+// possible exercises:
+
+// exercise on Parquet
+
+// window (batch, not streaming!)

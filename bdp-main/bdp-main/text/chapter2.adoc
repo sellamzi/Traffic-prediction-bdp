@@ -1,0 +1,1906 @@
+[[ch:batch]]
+= Batch Processing
+We first establish the general principles of batch processing, and then use Apache Spark as the primary case study, exploring its core abstractions.
+
+== General Principle
+Batch processing is a computational model where a program reads a finite, static collection of input data (a bounded dataset) and processes it in its entirety to produce a finite set of output data.
+This model is one of the oldest in computing, suited for tasks where data is collected over a period and then processed offline, such as nightly https://en.wikipedia.org/wiki/Extract,_transform,_load[ETL] (Extract, Transform, Load) jobs, financial report generation, or large-scale scientific data analysis.
+
+The traditional batch model, often designed for structured data from operational databases, functions well when running on a single, powerful server.
+However, this model breaks down when confronted with the Volume and Variety of Big Data.
+When input data grows from gigabytes to terabytes or petabytes, and includes unstructured sources like weblogs or social media feeds, a single machine can no longer perform the required processing steps in a reasonable timeframe, and its I/O, CPU, and memory become bottlenecks.
+To handle Big Data, the model must therefore evolve from scaling up a single server to scaling out across a cluster of _multiple_ machines.
+This shift necessitates a move to _distributed_ batch processing, where the data and the computation are partitioned and executed in parallel across an entire cluster.
+
+== MapReduce
+While the need for distributed processing became clear, programming these systems was historically complex. 
+Developers had to manually handle the low-level steps: splitting datasets, distributing work to nodes, collecting and combining results, handling any node or network failures that came along.
+The breakthrough came with MapReduce, a programming model that provided a high-level abstraction for processing large datasets in parallel across a cluster, hiding the messy details of distributed systems from the developer.
+
+The concept of MapReduce originated at Google. 
+It was first described in a seminal 2004 research paper as their internal solution for processing the immense amount of data required to build their web search index [<<dean2008>>].
+The power of MapReduce was that it abstracted the entire distributed workflow into just two user-defined functions: `map` and `reduce`.
+
+. `map` applies a function to each split of the data in parallel.
+. `reduce` aggregates, combines, or summarizes the intermediate results.
+
+The MapReduce engine would handle concerns such as data partitioning, parallel execution, shuffling and sorting between stages, and fault tolerance.
+Because this simple, two-function abstraction made large-scale distributed computing more approachable for non-experts, it is considered as the foundational programming model for distributed batch processing.
+
+[[exa:mapreduce-word-count]]
+.MapReduce word counting.
+====
+Word counting is the '`hello world`' of Big Data processing because it's a simple, relatable problem.
+Imagine you have a massive collection of documents, and you want to count the occurrences of every word across this collection.
+Solving the word count problem using the MapReduce paradigm breaks the task into three phases:
+
+. Map: In parallel, each machine reads its local chunk of documents, splits them into individual words, and outputs a list of intermediate pairs, such as `("Deer", 1)`, `("Bear", 1)`, `("River", 1)`.
+. Shuffle: The system automatically reorganizes the data, grouping all pairs with the same key (the same word) together.
+. Reduce: In parallel, each machine receives a key and the list of all its associated values, such as `("Car", [1, 1, 1])`, and aggregates them by summing the values to produce the final count, like `("Car", 3)`.
+
+.MapReduce word count example <<todaysoftmag>>.
+image::mapreduce-wordcount.png[]
+====
+
+Although MapReduce is often reduced to the two steps that constitute its name, <<exa:mapreduce-word-count>> shows that _shuffle_ is a critical, implicit step that makes the final aggregation possible. 
+After the map phase, the intermediate `(<word>, 1)` pairs are scattered across the entire cluster.
+For example, two machines in our example have produced `("Deer", 1)`.
+To get a final count for the word `"deer"`, all of these intermediate pairs must be brought to a single location.
+The shuffle phase handles this data movement. 
+It is a cluster-wide sorting and data transfer operation where the framework collects all values for each unique key from all mappers and delivers them to a single reducer. 
+This redistribution is the most computationally expensive part of the process, as it's dominated by network I/O, but it is essential for the reduce phase to be able to perform its aggregation correctly.
+We'll encounter shuffling several times in the remainder this chapter.
+
+== Apache Hadoop
+The MapReduce concept directly led to a surge in big data tools designed around this model.
+One of the most well-known early open-source implementations was https://hadoop.apache.org/[Apache Hadoop].
+Hadoop was designed to solve the problem of splitting workloads across many machines, tolerate failures, and aggregate results.
+It provides https://hadoop.apache.org/docs/r1.2.1/hdfs_design.html[HDFS] (Hadoop Distributed File System) for storing large datasets across many machines.
+Importantly, for a long time Hadoop relied on only a MapReduce engine for actually processing the data.
+
+However, the original Hadoop MapReduce implementation has significant performance limitations.
+Most notably, it relies on writing all intermediate results to HDFS for robust <<sec:fault-tolerance, fault tolerance>>.
+After each map task completes, its output is written to the local disk of a worker node.
+More significantly, however, after the reduce phase, the final output is again written back to HDFS (<<fig:hadoop-disk-bottleneck>>).
+This design, while ensuring extreme fault-tolerance, introduces substantial I/O costs and latency, as every step in a multi-stage job requires expensive disk and network operations (including replication overhead), and prevented data pipelining between jobs.
+// TODO link/explain pipelining
+
+[[fig:hadoop-disk-bottleneck]]
+.Hadoop's principal performance bottleneck: the mandatory write-to-disk step between MapReduce steps introduces significant I/O costs and latency.
+image::hadoop-disk-bottleneck.png[]
+
+The performance penalty is particularly severe for <<exa:logistic-regression, iterative algorithms>> common in machine learning, and for interactive data analysis where each query incurs the full overhead of reading from and writing to disk.
+This situation effectively set the stage for the development of next-generation, in-memory processing frameworks like Apache Spark.
+
+== Apache Spark
+Apache Spark was developed as a direct successor to address the limitations of the MapReduce solutions such as Hadoop.
+It improved over these solutions in the following ways:
+
+. In-memory computation: Spark's primary innovation is its ability to perform computations in memory, keeping intermediate data in RAM across multiple steps rather than writing to disk.
+This can lead to performance improvements of up to 100x for iterative algorithms and interactive queries when compared to Hadoop.
+
+. General-purpose engine: Spark provides a single, unified engine for not only batch processing, but also <<ch:declarative,SQL queries>>, <<ch:discretized-stream,stream processing>>, and machine learning, making it more suitable for modern data engineering practices.
+
+. Rich, concise APIs: Spark's APIs (in Scala, Java, Python, and others) are significantly more expressive and less verbose than traditional MapReduce code, allowing developers to build complex data pipelines more efficiently.
+
+Spark is optimized to hide latency while still being fault tolerant.
+Its core idea is to treat data as immutable, in-memory collections called <<sec:RDDs,RDDs>>, and to express operations as a series of functional <<sec:transformations,transformations>> (`map`, `filter`, etc.) on these collections.
+Instead of writing intermediate data to disk like Hadoop, Spark achieves fault tolerance by tracking the <<sec:lineage,lineage>> of these transformations.
+If data is lost, Spark can simply replay the necessary steps on the original dataset to regenerate it, providing resilience without the persistent I/O overhead of a MapReduce solution.
+
+[[sec:RDDs]]
+== Resilient Distributed Datasets (RDDs)
+// In chapter 2 we will use the Apache Spark framework for distributed data-parallel programming.
+// Spark implements a distributed data parallel model called Resilient Distributed Datasets (RDDs)
+The fundamental abstraction in Apache Spark is the Resilient Distributed Dataset (RDD).
+An RDD is an immutable, partitioned collection of data designed to be operated on in parallel.
+It directly embodies Spark's core philosophy of achieving high performance and fault tolerance through a functional programming model that tracks data lineage, rather than through explicit data replication.
+
+RDDs have the following key properties:
+
+. Distributed: the data within an RDD is logically partitioned (<<fig:rdd-logical>>), and these partitions are distributed across the different worker nodes of the cluster (<<fig:rdd-parallel>>).
+This distribution allows Spark to execute computations on the data in parallel.
+
+. Resilient: RDDs achieve <<sec:fault-tolerance, fault tolerance>> through <<sec:lineage,lineage>>, which is a record of the transformations used to create them.
+Instead of storing copies of the data, Spark stores this '`recipe`'. 
+If a partition is lost due to a node failure, Spark can automatically use the lineage to recompute just the lost partition from the source data.
+
+. Immutable: an RDD cannot be changed after its creation.
+When a <<sec:transformations, transformation>> is applied to an RDD, it produces a new RDD. 
+This immutability is crucial for making lineage tracking simple and predictable.
+
+. Lazily evaluated: transformations are not executed immediately. 
+Instead, the full chain of transformations are recorded in a Directed Acyclic Graph (DAG) representing lineage.
+Computation is only triggered when an <<sec:actions,action>> (e.g., `count()`, `collect()`, `saveAsTextFile`) is called, which allows Spark to optimize the entire data processing workflow before execution.
+
+// RDDs are made up of 4 parts:
+// . Partitions: atomic pieces of the dataset, of which 1 or more are on each worker node.
+// . Dependencies: models relationship between this RDD and its partitions with the RDDs it was derived from.
+// . A function for computing the dataset based on its parent RDD (`map`, `filter`, `union`, `cartesianProduct`, etc.)
+// . Metadata about its partitioning scheme and data replacement.
+
+=== Partitioning
+// FIXME there is another more detailed section about partitioning, but we need the info below to have a better mental grasp on what is explained here (in the initial example etc.)
+<<fig:rdd-logical>> shows how data in an RDD is logically partioned.
+
+[[fig:rdd-logical]]
+.Data in an RDD is logically partitioned.
+image::rdd-logical.png[,200]
+
+[[fig:rdd-parallel]]
+.An RDD is designed to be operated on in parallel.
+image::rdd-parallel.png[,400]
+
+<<sec:partitioning, Partitioning>> is the process of splitting a large dataset into smaller, logical chunks called partitions.
+
+It's the fundamental mechanism that enables parallel processing in a distributed system like Spark.
+By breaking the data into partitions, Spark can send each partition to a different worker node in the cluster.
+This allows multiple tasks to run simultaneously on different subsets of the data, significantly speeding up the overall computation.
+
+Partitions never span multiple machines, and each machine in the cluster may contain one or more partitions.
+The number of partitions to use is configurable.
+By default, it equals the total number of cores on all executor nodes.
+
+=== Operations
+The API for an RDD is intentionally and conceptually modeled on the functional operations available for Scala collections.
+This makes it intuitive for developers, as operations like `map`, `filter`, and `reduce` behave in a familiar way. 
+However, a crucial difference is that operations on RDDs are executed in a distributed, parallel fashion across a cluster.
+
+All operations on an RDD can be divided into two distinct categories: transformations and actions.
+
+. <<sec:transformations, Transformations>> are lazy operations that create a new RDD from an existing one.
+
+. <<sec:actions, Actions>> are operations that trigger a computation and return a result.
+
+=== A First Example
+[[exa:rdd-first]]
+.First RDD example.
+====
+In the example program below, `sc.textFile("example.log")` reads a text file from the given path and creates an RDD where each element is a single line from the file (type `RDD[String]`).
+At this stage, Spark does not actually read the file; it only creates a pointer to it and notes the operation in the RDD's lineage.
+
+Next, the  `logLines.filter(...)` transformation takes the original RDD and applies a function to each element, producing a new RDD `errorLines` that contains only the elements for which the function returns true. 
+Because `filter` is a transformation, again _no_ computation happens at this point and Spark simply adds this step to the lineage graph.
+
+Then, `errorLines.count()` is an action that is the trigger that causes Spark to execute the entire chain of computations (the DAG).
+Spark will read the log file, apply the filter operation in parallel across its partitions, and finally count the elements in the resulting RDD, returning the final number.
+
+The `take(5)` action similarly triggers a job but stops as soon as it has found 5 matching lines, demonstrating Spark's lazy evaluation optimization.
+Even if there would be a million log lines in the file, Spark stops computing as soon as it has scanned the partitions to store exactly five log lines in an array.
+The example ends by printing these 5 log lines in the resulting array.
+
+[source, scala]
+----
+// load data into an RDD
+val logLines: RDD[String] = sc.textFile("example.log")
+
+// transform the data to find error lines
+val errorLines: RDD[String] = logLines.filter(line => line.contains("ERROR"))
+
+// perform an action to get the result
+val numErrors: Long = errorLines.count()
+
+println(s"The log file contains ${numErrors} error lines.")
+
+// example of another action to inspect the data
+println("First 5 error lines:")
+errorLines.take(5).foreach(println)
+----
+====
+
+<<exa:rdd-first>> shows a simple example of creating and operating on RDDs.
+The example program loads an external text file into an RDD of strings.
+Then a filter transformation is applied to only keep log lines containing `"ERROR"`.
+Next, the program counts the number of such lines.
+Finally, the first 5 error lines are taken and printed.
+
+In this and subsequent examples we will assume that the `SparkContext` is available as the variable `sc`.
+The `SparkContext`, part of the higher-level `SparkSession` entry point, is the main entry point for RDD-based programming.
+See the <<exe:batch,exercises>> for more details and examples of how to create and use these entry points.
+
+TIP: You can also run examples by starting a Spark shell issuing the command `spark-shell`.
+This starts an interactive Scala REPL with a pre-configured `SparkSession` available as the variable `spark` and the underlying `SparkContext` available as `sc`.
+
+== Creating RDDs
+There are two primary ways to create an RDD: by parallelizing an existing collection in a driver program, or by referencing a dataset in an external storage system.
+We discuss two interesting and widely used constructors below, but there are several other useful RDD constructors for more specific use cases that you can find in the <<spark, Spark documentation>>.
+
+=== Parallelized collections
+[source, scala]
+def parallelize[T](seq: Seq[T], numPartitions: Int = defaultParallelism): RDD[T]
+
+This method is useful for prototyping, testing, and for situations where your data already exists in memory on the driver node.
+The parallelize method copies the collection to the cluster to form a distributed dataset.
+Spark will run one task for each partition of the cluster.
+
+Parameter `numPartitions` is the number of partitions to cut the collection into.
+Spark tries to set the number of partitions automatically based on your cluster.
+However, you can also set it manually by passing it as a second parameter to parallelize.
+The official <<spark, Spark documentation>> advises two to four partitions for each CPU in a Spark cluster. 
+
+.`parallelize` example.
+====
+The following code shows how to create a parallelized collection holding the numbers 1 to 5.
+
+[source, scala]
+----
+// create an RDD of integers from a local Scala List
+val data = List(1, 2, 3, 4, 5)
+val rdd = sc.parallelize(data)
+----
+====
+
+=== External datasets
+Spark can create RDDs from any storage source supported by Hadoop, including your local file system, HDFS, Cassandra, Amazon S3, and others.
+
+[source, scala]
+def textFile(path: String, minPartitions: Int = defaultMinPartitions): RDD[String]
+
+The `textFile` method is the most common way in a real application to create an RDD from text files, where each element of the RDD is a line of text.
+When using a local file system, the file must be available on all nodes.
+<<exa:rdd-first>> illustrates the use of `textFile`.
+
+
+[[sec:transformations]]
+== Transformations
+Transformations are lazy operations in Spark that create a new RDD from an existing one.
+They can therefore be recognized by their return type (`RDD`).
+
+Because transformations are lazy, they do not execute immediately when you call them.
+Instead, Spark builds a recipe of the operations you apply.
+This recipe is a logical execution plan known as a <<sec:lineage, lineage graph>>, which is a directed acyclic graph (DAG).
+The actual computation is only triggered when you call an <<sec:action, action>> like `count`, `collect`, or `saveAsTextFile` on the RDD.
+This allows Spark to analyze the entire workflow and optimize it _before_ running anything on the cluster (<<sec:execution-flow>>).
+
+=== Transformations on single RDDs
+[source, scala]
+def map[B](f: A => B): RDD[B]
+
+Applies a function to each element in the RDD and returns a new RDD with the results.
+
+[source, scala]
+def flatMap[B](f: A => TraversableOnce[B]): RDD[B]
+
+Similar to `map`, but each input item can be mapped to 0 or more output items.
+
+[source, scala]
+def filter(f: A => Boolean): RDD[A]
+
+Returns a new RDD containing only the elements that satisfy a predicate function.
+
+[source, scala]
+def distinct(): RDD[A]
+
+Return a RDD with the duplicates removed.
+
+=== Set transformations on two RDDs
+[source, scala]
+def union(other: RDD[A]): RDD[A]
+
+Returns a new RDD containing all elements from both the source and the argument RDDs.
+Duplicates are included, meaning this operation behaves like a list concatenation.
+
+[source, scala]
+def intersection(other: RDD[A]): RDD[A]
+
+Returns a new RDD containing only the elements that are present in both the source and the argument RDDs.
+The result will contain unique elements.
+
+[source, scala]
+def subtract(other: RDD[A]): RDD[A]
+
+Returns a new RDD containing elements from the source RDD that are not found in the argument RDD.
+
+[source, scala]
+def cartesian(other: RDD[B]): RDD[(A, B)]
+
+Returns the Cartesian product of the two RDDs, resulting in a new RDD of all possible pairs `(a, b)` where `a` is from the source RDD and `b` is from the argument RDD.
+This operation is computationally _very_ expensive and should be used with caution.
+
+[[sec:actions]]
+== Actions
+Actions are Spark operations that trigger the execution of a job.
+They are the catalyst that takes the logical plan defined by the RDD's <<sec:lineage, lineage>> and turns it into a physical job that runs on the cluster.
+//TODO fw ref 'physical job'
+Until an action is called, no computation is performed.
+Unlike transformations, which return a new RDD, actions either return a final result to the driver program (e.g., a count or a collection) or write data to an external storage system.
+
+=== Typical actions on RDDs
+[source, scala]
+def collect(): Array[A]
+
+Returns all elements of the RDD as an array to the driver program.
+Use this and similar operations that return a collection with caution, as in a '`true`' big data setting this can cause an `OutOfMemoryError` if the dataset is too large to fit in the driver's memory.
+
+[source, scala]
+def count(): Long
+
+Returns the total number of elements in the RDD.
+
+[source, scala]
+def take(num: Int): Array[A]
+
+Returns an array to the driver containing the first `num` elements of the RDD.
+This, and similar actions should only be used if the resulting array is expected to be small, as all the data is loaded into the driver's memory.
+// TODO exercise on why this is an action?
+
+[source, scala]
+def reduce(f: (A, A) => A): A
+
+Aggregates the elements of the RDD in parallel using a specified binary function that must be both _commutative_ and _associative_.
+
+[source, scala]
+def foreach(f: A => Unit): Unit
+
+Applies a function to each element of the RDD.
+This is typically used for side effects, like printing to screen or writing to a database.
+The function `f` executes on the _worker nodes_.
+This is a critical distinction in a true distributed environment, as it contrasts with local mode where the driver and workers all run inside the same single JVM.
+
+=== Other useful actions
+[source, scala]
+def takeSample(withRepl: Boolean, num: Int): Array[A]
+
+Returns an array to the driver with a random sample of num elements, specifying whether sampling is done with or without replacement (i.e., with or without '`putting back`' selected items).
+
+[source, scala]
+def takeOrdered(num: Int)(implicit ord: Ordering[A]): Array[A]
+
+Returns the first `num` elements of the RDD, sorted by their natural order or a provided custom comparator.
+
+[source, scala]
+def saveAsTextFile(path: String): Unit
+
+Saves the RDD to a text file or a directory of text files.
+When run on a cluster, it writes a directory containing multiple part-files, one for each partition of the RDD.
+
+=== Short-Circuit Evaluation
+The lazy evaluation of RDDs allows for a more efficient execution of actions that do not require a full scan of the data.
+Consider a <<sec:pipelining, pipeline>> of transformations ending with an action that looks like `someRdd.filter(...).map(...).take(n)`.
+Because of lazy evaluation, Spark doesn't execute the `filter` or `map` operations until `take(n)` is called.
+When it does start the job, it knows its ultimate goal is just to find `n` records.
+Therefore, it can _short-circuit_ the execution of the preceding transformations, processing just enough partitions to find the required number of records and then stopping, rather than processing the entire dataset through the full transformation chain.
+In contrast, in an eager model the entire dataset would have to be filtered first before the first `n` elements could be taken.
+
+Although the benefit of short-circuiting is realized because of specific actions, it applies to the _entire_ chain of preceding transformations.
+The efficiency gain comes from Spark applying this condition to the entire lazy transformation pipeline.
+This short-circuiting behavior is similar to how lazy lists or streams operate in functional programming languages like Scala or Haskell.
+
+
+== Pair RDDs
+A Pair RDD is an RDD that has key-value pairs as type of elements, i.e., they are of type `RDD[(K, V)]`.
+Spark treats Pair RDDs in a special way by exposing specialized, efficient transformations and actions on pairs that fulfil requirements in data aggregation and enrichment tasks (aggregating, joining, mapping, sorting, etc.)
+
+Pair RDDs can have a <<sec:partitioning-pairs, partitioner>> set that guarantees that pairs with identical keys are in the same partition.
+This partitioner object can be implictly set by operations that require it, or explictly by the programmer for optimization purposes.
+
+It's easy to confuse Spark's Pair RDDs with their keys and values with a `Map` data type.
+However, Pair RDDs can, and often do, have _multiple_ identical keys.
+A Pair RDD therefore is _not_ a distributed `Map` (which enforces unique keys), but a distributed collection of key-value pairs.
+An RDD is just a collection of data elements, and a Pair RDD is a collection of pairs.
+There is no inherent constraint that keys must be unique. 
+// In Spark, a Pair RDD is a collection of records that are specifically two-element tuples.
+// record: named fields; tuple: positional access
+
+// We will revisit concerns like wide transformations, shuffling, and persistence, which were already introduced earlier in this chapter.
+// However, because of the broad usage and applicability of Pair RDDs in high-impact scenarios, these concerns are not just convenient to know about, but become _critical_ to understand well to achieve decent performance.
+
+[[sec:pair-rdd-motivation]]
+=== Motivation for Pair RDDs
+Large datasets are often made up of huge numbers of complex, nested data records.
+To be able to work with such datasets, it's often desirable to project down these complex datatypes into _key-value_ pairs.
+
+// the need for keys: some problems cannot be solved with simple narrow transformations, such as aggregating data by a specific attribute (e.g., "count website visits per user ID"). This creates a clear need for a key-value data structure.
+
+[[exa:pair-rdd-map-down]]
+====
+Image a JSON log file that keeps records of user's sessions on some system.
+Below is one such record for a single session for some user.
+
+[source,json]
+----
+{
+  "event_id": "evt_12345",
+  "timestamp": "2025-08-23T15:10:00Z",
+  "user": {
+    "user_id": "u_925903468",
+    "name": "Alice",
+    "country": "BE"
+  },
+  "session": {
+    "session_id": "sess_xyz",
+    "duration_seconds": 120
+  }
+}
+----
+If you want to find the total time spent by each user using a system, you typically start by projecting each log entry (session) in a key-value pair consisting of the user and the duration of the session: `( "u_abc", 120 )`.
+The `user_id` is the key, used for grouping all sessions belonging to a single user.
+The `duration_seconds` is the value, used for aggregating all session durations for a particular user, in this case by adding all durations for a particular user.
+====
+
+// ====
+// Example: given data records of Wikipedia pages, give me a list of contributors to wikipedia pages together with the number of contributions they have made.
+
+// [source,scala] 
+// contributor: String -> page: WikipediaPage
+
+// Example: Given data records of people, for every city, count the number of inhabitants in that city that are older than 60.
+
+// [source,scala] 
+// city: String -> person: Person
+// ====
+
+=== Pair Transformations
+
+
+==== Aggregating Pairs
+Spark provides a set of powerful transformations designed to aggregate Pair RDDs by combining the values associated with each key.
+The  purpose of transformations like `aggregateByKey` and others discussed below, is to take an RDD with many duplicate keys and combine the values for those keys into a new RDD where the keys are now _unique_.
+
+[source,scala]
+def groupByKey(): RDD[(K, Iterable[V])]
+
+Returns a new Pair RDD where every element with a common key is grouped together in a new collection.
+This operation should be used with caution, as the entire collection of values (`Iterable[V]``) for a single key must fit into the memory of a single worker node, which can easily lead to an `OutOfMemoryError` if any key has a very large number of values.
+
+[source,scala]
+def reduceByKey(func: (V, V) => V): RDD[(K, V)]
+
+Returns a new Pair RDD where every element with a common key is reduced to a single value of the same type using the provided function.
+
+[source,scala]
+def foldByKey(zeroValue: V)(func: (V, V) => V): RDD[(K, V)]
+
+Similar to `reduceByKey` but uses a provided '`zero value`'.
+
+[source,scala]
+def aggregateByKey[U](zeroValue: U)(seqOp: (U, V) => U, combOp: (U, U) => U): RDD[(K, U)]
+
+This is the most general and flexible of Spark's per-key aggregation operations because it allows the aggregated result to be of a completely different type (`U`) than the input values (`V`). 
+Function `seqOp` merges `V` values within a single partition into a `U` value, and `combOp` merges two `U` values from different partitions. 
+The ability to change types is essential for more complex aggregations (e.g., calculating an average) where you need to maintain intermediate state (a sum and a count) that is of a different type (a pair) than the elements.
+
+====
+[source, scala]
+----
+// (ProductCategory, SaleAmount)
+val salesData = List(
+  ("Electronics", 500),
+  ("Books", 20),
+  ("Electronics", 1300),
+  ("Groceries", 45),
+  ("Books", 30),
+  ("Electronics", 300)
+)
+
+val salesRdd: RDD[(String, Int)] = sc.parallelize(salesData)
+
+val groupedSalesRdd: RDD[(String, Iterable[Int]] = salesRdd.groupByKey()
+groupedSalesRdd.collect().foreach(println)
+// (Groceries, Seq(45))
+// (Books, Seq(20, 30))
+// (Electronics, Seq(500, 1300, 300))
+
+val totalSalesRdd: RDD[(String, Iterable[Int])] = salesRdd.reduceByKey(_ + _)
+totalSalesRdd.collect().foreach(println)
+// (Groceries, 45)
+// (Books, 50)
+// (Electronics, 2100)
+
+val seqOp = (acc: (Int, Int), value: Int) => (acc._1 + value, acc._2 + 1)
+val combOp = (acc1: (Int, Int), acc2: (Int, Int)) => (acc1._1 + acc2._1, acc1._2 + acc2._2)
+val salesSummaryRdd: RDD[(String, (Int, Int))] = salesRdd.aggregateByKey((0,0))(seqOp, combOp)
+salesSummaryRdd.collect().foreach(println)
+// (Groceries,(45,1))
+// (Books,(50,2))
+// (Electronics,(2100,3))
+
+val averageSalesRdd = salesSummaryRdd.mapValues { case (sum, count) => sum.toDouble / count }
+averageSalesRdd.collect().foreach(println)
+// (Groceries, 45.0)
+// (Books, 25.0)
+// (Electronics, 700.0)
+----
+====
+
+
+
+==== Joining Pairs
+Joining is the process of combining two key-value RDDs based on their common keys. 
+It's one of the most fundamental operations in data processing, used to enrich one dataset with information from another.
+
+For example, you might have one RDD containing user profile data `(userID, userInfo)` and another containing user activity `(userID, activityData)`. 
+A `join` allows you to create a new, combined RDD `(userID, (userInfo, activityData))`.
+
+// cogroup(other): Groups the data from both RDDs that share the same key.
+
+There are 2 kinds of joins: inner joins (`join`) and outer joins (`leftOuterJoin`, `rightOuterJoin`).
+
+[source, scala]
+def join[W](other: RDD[(K, W)]): RDD[(K, (V, W))]
+
+This is the most common type. 
+It returns a new RDD containing only the keys that are present in both parent RDDs. 
+If a key exists in one RDD but not the other, it's dropped from the result.
+
+[source, scala]
+def leftOuterJoin[W](other: RDD[(K, W)]): RDD[(K, (V, Option[W]))]
+
+This returns a new RDD that includes all keys from the '`left`' RDD (the one the method is called on).
+If a matching key exists in the '`right`' RDD, its value is included.
+If not, the value is filled with a placeholder like `None`.
+
+[source, scala]
+def rightOuterJoin[W](other: RDD[(K, W)]): RDD[(K, (Option[V], W))]
+
+This is the mirror of `leftOuterJoin`. 
+It includes all keys from the '`right`' RDD, filling in missing values from the left with `None`.
+
+====
+[source, scala]
+----
+// (ProductCategory, SaleAmount)
+val salesData = List(
+  ("Electronics", 500),
+  ("Books", 20),
+  ("Electronics", 1300),
+  ("Groceries", 45),
+  ("Books", 30),
+  ("Electronics", 300)
+)
+val managerData = List(
+      ("Electronics", "Alice"),
+      ("Books", "Bob"),
+      ("Apparel", "Charlie")
+    )
+
+val categoryManagersRdd: RDD[(String, String)] = sc.parallelize(managerData)
+
+val totalSalesRdd: RDD[(String, Int)] = sc.parallelize(salesData).reduceByKey(_ + _)
+// (Groceries, 45)
+// (Books, 50)
+// (Electronics, 2100)
+
+val innerJoinRdd: RDD[(String, (Int, String))] = totalSalesRdd.join(categoryManagersRdd)
+innerJoinRdd.collect().foreach(println)
+// (Books, (50, Bob))
+// (Electronics, (2100, Alice))
+
+val leftOuterJoinRdd: RDD[(String, (Int, Option[String]))] = totalSalesRdd.leftOuterJoin(categoryManagersRdd)
+leftOuterJoinRdd.collect().foreach(println)
+// (Groceries, (45, None))
+// (Books, (50, Some(Bob)))
+// (Electronics, (2100, Some(Alice)))
+
+val rightOuterJoinRdd: RDD[(String, (Option[Int], String))] = totalSalesRdd.rightOuterJoin(categoryManagersRdd)
+rightOuterJoinRdd.collect().foreach(println)
+// (Apparel, (None, Charlie))
+// (Books, (Some(50), Bob))
+// (Electronics, (Some(2100), Alice))
+----
+====
+
+==== Sorting and Other Pair Transformations
+These are other common key-based manipulations.
+
+[source,scala]
+def sortByKey(ascending: Boolean = true, numPartitions: Int = self.partitions.length): RDD[(K, V)]
+
+Sorts the RDD by its keys.
+The keys must be ordered.
+
+[source,scala]
+def mapValues[U](f: V => U): RDD[(K, U)]
+
+Applies a function to the value of each key-value pair without changing the key.
+In effect, `rdd.mapValues(f)` is equivalent to `rdd.map {case (k, v): (k, f(v))}`.
+Importantly, unlike `map`, `mapValues` always preserves the <<sec:partitioning-pairs, partitioning>>, preventing future expensive shuffles.
+
+[source,scala]
+def flatMapValues[U](f: V => IterableOnce[U]): RDD[(K, U)]
+
+Similar to `mapValues`, but each value can be mapped to zero or more new values.
+`flatMapValues` then creates a new output pair for each new value, all sharing the original key.
+
+[source,scala]
+def keys: RDD[K]
+def values: RDD[V]
+
+These narrow transformations return a new RDD containing only the keys or only the values from the original Pair RDD, respectively.
+They are transformations (and not actions) because the number of keys or values in a distributed dataset can be enormous and therefor far too large to fit in memory on the driver node. 
+By returning another RDD, Spark allows you to continue processing this data in a distributed manner.
+
+====
+[source, scala]
+----
+def salesData = ...
+def salesRdd = ...
+
+val sortedSalesRdd: RDD[(String, Int)] = totalSalesRdd.sortByKey()
+sortedSalesRdd.collect().foreach(println) 
+// (Books, 50)
+// (Electronics, 2100)
+// (Groceries, 45)
+
+val formattedSalesRdd: RDD[(String, String)] = sortedSalesRdd.mapValues(amount => s"EUR ${amount}.00")
+formattedSalesRdd.collect().foreach(println)
+// (Books, EUR 50.00)
+// (Electronics, EUR 2100.00)
+// (Groceries, EUR 45.00)
+
+val detailedRecordsRdd: RDD[(String, (String, Double))] = formattedSalesRdd.flatMapValues { amountString =>
+  val amount = amountString.stripPrefix("EUR").stripSuffix(".00").toDouble
+  List(("Sales", amount), ("Tax", amount * 0.1))
+}
+detailedRecordsRdd.collect().foreach(println)
+// (Books, (Sales, 50.0))
+// (Books, (Tax, 5.0))
+// (Electronics, (Sales, 2100.0))
+// (Electronics, (Tax, 210.0))
+// (Groceries, (Sales, 45.0))
+// (Groceries, (Tax, 4.5))
+
+val categoriesRdd: RDD[String] = detailedRecordsRdd.keys
+categoriesRdd.distinct().collect().foreach(println)
+// Books
+// Electronics
+// Groceries
+
+val amountsRdd: RDD[(String, Double)] = detailedRecordsRdd.values
+amountsRdd.collect().foreach(println)
+// (Sales, 50.0)
+// (Tax, 5.0)
+// (Sales, 2100.0)
+// (Tax, 210.0)
+// (Sales, 45.0)
+// (Tax, 4.5)
+----
+====
+
+=== Pair Actions
+These actions are specific to Pair RDDs and return results to the driver.
+
+[source,scala]
+def countByKey(): Map[(K, Long)]
+
+Counts the number of elements for each key, returning a `Map` mapping from keys to counts.
+
+[source,scala]
+def collectAsMap(): Map[(K, V)]
+
+Collects the result as a `Map`.
+If the source Pair RDD contains duplicate keys, this action will non-deterministically resolve this conflict by simply keeping the last value it encounters for each key. 
+
+[source,scala]
+def lookup(key: K): Seq[V]
+
+Returns all values associated with a given key in a `Seq`.
+
+// ====
+// TODO
+// ----
+// ----
+// ====
+
+[[sec:lineage]]
+== Lineage
+The lineage graph is a directed acyclic graph (DAG) that is composed exclusively of RDDs and the transformations that connect them. 
+It is the static, logical '`recipe`' or '`blueprint`' that shows how to compute a final RDD from a source RDD.
+A lineage graph does not contain actions.
+
+[[exa:lineage]]
+====
+Consider the following program.
+
+[source,scala]
+----
+val data = Seq(
+      "Apache Spark is fast",
+      "Spark is powerful",
+      "RDD lineage is a DAG"
+)
+
+val rdd0 = sc.parallelize(data)
+val rdd1 = rdd0.flatMap(_.split(" "))
+val rdd2 = rdd1.filter(_.length > 3)
+val rdd3 = rdd2.map(_.toLowerCase)
+
+println("\n=== RDD Lineage ===")
+println(rdd3.toDebugString)
+----
+
+This program prints the following debug string:
+
+      (14) MapPartitionsRDD[3] at map ... 
+      |   MapPartitionsRDD[2] at filter ... 
+      |   MapPartitionsRDD[1] at flatMap ... 
+      |   ParallelCollectionRDD[0] at parallelize ...
+
+This debug string starts at `rdd3`, the RDD on which `toDebugString` is called.
+It then shows that `rdd3` results from applying a `map` transformation on `rdd2`, and so on, all the way to `rdd0`, the origin RDD resulting from `parallelize`.
+The lineage graph that results is depicted in <<fig:lineage>>.
+
+Note that no action is involved to obtain the lineage graph, only transformations.
+
+[[fig:lineage]]
+.Lineage graph for the program in <<exa:lineage>>.
+image::lineage.png[,400]
+// you should see one stage in the Web UI
+====
+
+[[exa:non-linear-lineage]]
+====
+Consider the following program.
+
+[source,scala]
+----
+val base = sc.parallelize(Seq(1, 2, 3, 4, 5))
+val even = base.filter(_ % 2 == 0)   // branch 1
+val odd  = base.filter(_ % 2 == 1)   // branch 2
+val combined = even.union(odd)
+
+println("\n=== RDD Lineage ===")
+println(combined.toDebugString)
+----
+
+This program prints the following debug string:
+
+      (28) UnionRDD[3] at union ...
+      |   MapPartitionsRDD[1] at filter ...
+      |   ParallelCollectionRDD[0] at parallelize ...
+      |   MapPartitionsRDD[2] at filter ...
+      |   ParallelCollectionRDD[0] at parallelize ...
+
+Only four RDDs are involved (note the RDD numbering between square brackets), as there are two RDDs, `even` and `odd`, that fork from RDD `base`.
+RDDs `even` and `odd` then join again in RDD `combined`, resulting in the lineage graph depicted in <<fig:non-linear-lineage>>.
+
+[[fig:non-linear-lineage]]
+.Lineage graph for the program in <<exa:non-linear-lineage>>.
+image::non-linear-lineage.png[,200]
+// you should see one stage in the Web UI
+====
+
+Lineage is the central, unifying concept behind Spark's lazy evaluation, fault tolerance, and execution plan optimization. 
+// TODO forward refs
+It enables Spark to remember how an RDD was derived, enabling it to recompute lost data partitions and to analyze the entire workflow before executing a single task.
+
+[[sec:persisting]]
+=== Persisting
+RDDs are evaluated in a lazy manner, meaning that their value is only computed when needed.
+However, this implies that if the value of an RDD is required multiple times, it will be recomputed upon each occasion, also when this is '`expensive`' (for example, because a <<sec:shuffling, shuffle>> is required).
+Therefore, if we must use an RDD multiple times, we can `.persist()` it to avoid recomputing its entire lineage from scratch each time.
+
+[[exa:rdd-persist]]
+.Persisting an RDD.
+====
+The example below processes a '`huge`' log file to create an RDD containing only the lines with the string `"ERROR"`.
+This filtered RDD is then used by two separate actions.
+Without intervention, Spark would _re-execute_ the expensive filter operation for each action.
+To avoid this redundant computation, we persist the filtered RDD, which caches its contents in memory after it is computed the first time (i.e., `persist` is a _lazy_ transformation itself).
+
+// ISSUE: persist will materialize the entire RDD, even if we only need 10 elements :(
+// so faster if also `count`, but not if only `take(10)`
+
+[source,scala]
+----
+val logs = sc.textFile("huge-server.log")
+val errors = logs.filter(_.contains("ERROR")).persist()
+
+// Action 1: Reuses the 'errors' RDD from cache
+val errorCount = errors.count()
+
+// Action 2: Reuses the 'errors' RDD from cache again
+val fatalErrors = errors.filter(_.contains("FATAL")).collect()
+----
+====
+
+// "Caching becomes especially important when an RDD is the result of an expensive shuffle operation. Recomputing a shuffled RDD is far more costly than recomputing one from a chain of narrow transformations, as it requires re-executing the entire network data transfer."
+
+// Example
+
+// // ```scala
+// // val data = sc.textFile(...)
+// // val pairs = data.map(line => (line.split(",")(0), 1))
+
+// // // An expensive shuffle operation
+// // val counts = pairs.reduceByKey(_ + _).persist() // CRITICAL to persist here!
+
+// // // Action 1: `counts` is computed once and cached
+// // val topCounts = counts.takeOrdered(10)(Ordering.by(_._2).reverse)
+
+// // // Action 2: Reuses the cached `counts` RDD, avoiding a second shuffle
+// // val totalUniqueKeys = counts.count()
+// // ```
+
+Persisting is especially useful in iterative algorithms, as illustrated in <<exa:logistic-regression>>.
+Persisting an RDD before an iterative algorithm, as the example shows, is the Spark equivalent of hoisting a loop-invariant computation.
+It's a critical optimization that ensures the unchanging source data is computed only once. 
+
+[[exa:logistic-regression]]
+==== 
+Logistic regression is a common algorithm used for classification problems. 
+It works by iteratively adjusting a set of weights to find the optimal boundary that separates different classes of data.
+
+Below is a core implementation of logistic regression.
+The mathematical details are not important, but the execution model _is_.
+
+[source,scala]
+----
+case class Point(x: Vector, y: Double)
+
+val points = sc.textFile(...).map(parsePoint).persist();
+var w = Vector.zeros(d)
+for (i <- 1 to numIterations) {
+      val gradient = points.map { p =>
+            (1 / (1 + exp(-p.y * w.dot(p.x))) - 1) * p.y * p.y
+      }.reduce (_ + _)
+      w -= alpha * gradient
+}
+----
+
+The key to understanding this code's performance is the `reduce` action inside the `for` loop.
+Because Spark's RDDs are evaluated lazily, each call to this `reduce` action would normally cause the entire lineage of the `points` RDD to be re-executed. 
+This means that in every single iteration, Spark would go all the way back to the source, read the text file, and parse it again.
+This re-computation is highly inefficient.
+
+The `persist` call after `map(parsePoint)` solves this problem.
+After the first action is called, the points RDD is computed and then stored (cached) in memory across the cluster. 
+For all subsequent iterations, the `reduce` action will read the points data directly from the cache, avoiding the expensive process of reading and parsing the original file repeatedly.
+====
+
+[source,scala]
+def persist(newLevel: StorageLevel): RDD[T]
+
+The `persist()` method allows you to specify a `StorageLevel` to control exactly how an RDD is stored.
+
+      NONE
+      DISK_ONLY
+      DISK_ONLY_2 
+      DISK_ONLY_3 
+      MEMORY_ONLY 
+      MEMORY_ONLY_2 
+      MEMORY_ONLY_SER 
+      MEMORY_ONLY_SER_2 
+      MEMORY_AND_DISK 
+      MEMORY_AND_DISK_2 
+      MEMORY_AND_DISK_SER 
+      MEMORY_AND_DISK_SER_2 
+      OFF_HEAP 
+
+You can choose to store it in memory (`MEMORY_ONLY`), on disk (`DISK_ONLY`), or a combination of both (`MEMORY_AND_DISK`) spilling to disk if the RDD doesn't fit in memory.
+
+Storage levels with a `SER` suffix additionally store RDDs in a serialized form.
+This can significantly reduce storage size, but increases CPU usage.
+
+`OFF_HEAP` stores data outside the JVM heap.
+This avoids garbage collection overhead and is useful for applications with very large memory requirements, but requires manual memory management.
+
+Certain storage levels also have a replicated counterpart, indicated by a `_2` or `_3` suffix.
+For example, `MEMORY_AND_DISK_2` caches each partition on two different cluster nodes.
+This allows a task to recover quickly from the loss of a worker node without having to recompute the lost partitions from the original lineage, providing faster <<sec:fault-tolerance, fault tolerance>> at the cost of double the storage space.
+
+[source,scala]
+def cache(): RDD[T]
+
+The `cache()` method is a shorthand method for persisting with the default storage level `MEMORY_ONLY`.
+It is exactly equivalent to calling `persist(StorageLevel.MEMORY_ONLY)`.
+
+
+[source,scala]
+def unpersist(blocking: Boolean = false): RDD[T]
+
+Marks an RDD as non-persistent and removes its blocks from memory and disk.
+
+The `unpersist` command manually removes an RDD from Spark's cache, freeing up storage memory.
+While Spark automatically evicts old data partitions using a Least Recently Used policy, manually unpersisting is an important optimization for proactively managing memory in certain scenarios.
+
+The optional blocking parameter determines whether the call will block until all the RDD's blocks have been physically removed.
+In most cases, the default non-blocking call is sufficient.
+
+[exa:unpersist]
+====
+In the example below, after one iteration of the loop has done its work, the intermediate data is no longer needed and should be unpersisted to ensure that the memory it requires can be released.
+
+The most common use case is within iterative algorithms.
+An RDD created inside a loop may be cached for that specific iteration, but it becomes useless in the next one. Explicitly calling `unpersist` at the end of the loop immediately frees up memory for the next iteration's data, which can prevent the cache from filling up and spilling to disk.
+
+[source,scala]
+----
+// an RDD that is constant across all iterations
+val staticData = sc.textFile("...").cache()
+
+for (i <- 1 to 1000) {
+  // Intermediate data specific to this iteration is joined and cached
+  val intermediateData = someRdd.join(staticData).cache()
+
+  // ... perform transformations and actions using intermediateData ...
+
+  val result = ...
+  println(s"Iteration $i result: $result")
+
+  // manually release the memory used by this iteration's data
+  intermediateData.unpersist()
+}
+----
+====
+
+[[sec:partitioning]]
+== Partitioning
+In Spark, an RDD is not a single entity; it is broken into smaller, logical chunks called partitions. 
+Each partition lives on a worker node and is the fundamental unit of parallelism.
+Partitions never span multiple machines, meaning all elements within the same partition are guaranteed to be on the same machine.
+This is a fundamental guarantee of Spark's architecture. 
+It ensures that a single <<sec:execution, task>> can operate on its assigned partition locally, which is the basis for achieving data locality and _efficient_ parallel execution.
+
+Understanding and controlling how your data is partitioned is one of the most effective ways to tune and optimize the performance of a Spark job:
+
+. *Performance tuning*: adjusting the number of partitions allows you to control the level of parallelism and ensure data is balanced evenly across the cluster, preventing bottlenecks where some tasks are overloaded while others are idle.
+
+. *Shuffle optimization*: for Pair RDDs, you can define a content-aware partitioning scheme. 
+This is the most powerful optimization in Spark, as it allows you to pre-organize data to completely avoid the expensive network shuffles that are otherwise required to satisfy <<sec:wide-dependency, wide dependencies>>.
+
+[[sec:default-partitioning]]
+=== Default Partitioning
+By default, Spark partitions data based on its source.
+
+* `sc.textFile()`: when reading from a file system, Spark typically creates one partition for each block of the file. 
+For example, a 128 MB block becomes one partition. 
+This strategy promotes data locality by processing the data on the same node where it's stored.
+
+* `sc.parallelize()`: when you create an RDD from an in-memory collection, Spark divides the data into a number of partitions specified as an optional argument, with the number of available cores in your cluster as a default.
+The elements within each partition, and the partitions themselves, maintain the same order as the original collection.
+
+=== Transformations for Repartitioning 
+Spark provides two general-purpose transformations to change the number of partitions for any RDD, including Pair RDDs. 
+These methods are used to control the level of parallelism or the layout of data on disk, and, in case of Pair RDDs, _without_ regard to their internal key-value structure.
+
+[source, scala]
+def repartition(numPartitions: Int): RDD[T]
+
+This method changes the number of partitions to the desired count. 
+It can be used to either increase or decrease the number of partitions, but it always triggers a full shuffle of the data across the network to ensure the new partitions are well-balanced.
+It's a costly operation but is useful for increasing parallelism.
+
+[source, scala]
+def coalesce(numPartitions: Int, shuffle: Boolean = false, partitionCoalescer: Option[PartitionCoalescer] = Option.empty): RDD[T]
+
+By default (`shuffle = false`), it avoids a full network shuffle by merging existing partitions on the same worker node. 
+This '`collapsing`' of partitions minimizes data movement across the cluster, making `coalesce` far more efficient than `repartition` for reducing the level of parallelism. 
+A common use case is to `coalesce` an RDD after a `filter` operation that has removed a large amount of data, which prevents having many small, inefficient partitions.
+
+If `coalesce` is called with `shuffle = true`, it becomes equivalent to `repartition`, triggering a full shuffle to re-distribute the data evenly.
+
+[[sec:partitioning-pairs]]
+=== Pair Partitioning
+For general-purpose RDDs, your control over partitioning is limited to changing the _number_ of partitions using `repartition` or `coalesce`. 
+These methods redistribute data without any awareness of its content. 
+You cannot, for example, place all strings that start with the letter `A` into the same partition without first transforming the data into a Pair RDD where the first letter is the key.
+This ability to perform _content-aware partitioning_ is exclusive to Pair RDDs and is fundamental to their importance in Spark.
+// A non-pair RDD is always partitioned, but its rdd.partitioner will always be None.
+
+Distribution of pairs across the cluster is controlled by a `Partitioner` object.
+A partitioner contains the specific logic or '`rule`' used to map an individual data record to a numerical partition ID. 
+This mapping is based on the key, providing a deterministic rule that dictates which partition a given pair will be sent to.
+
+Pair partitioning happens implicitly or explicitly, and the framework provides two primary partitioning schemes: hash partitioning and range partitioning.
+
+==== Implicit partitioning
+Implicit partitioning occurs as a _necessary_ consequence of transformations like `join` or `groupByKey`.
+These transformations logically cannot be completed unless all data for a given key is co-located.
+To satisfy this requirement, Spark must perform a shuffle, and this shuffle applies a new partitioner (typically a `HashPartitioner`) to the data.
+The new partitioning scheme in this is not the goal, but the necessary byproduct of making certain operations possible.
+
+[[exa:implicit-partitioning]]
+====
+Consider the following code that parallelizes fictitious sales data using 4 partitions.
+
+[source, scala]
+----
+// (ProductCategory, SaleAmount)
+val salesData = List(
+  ("Electronics", 500),
+  ("Books", 20),
+  ("Zen-Decor", 385),
+  ("Electronics", 1300),
+  ("Groceries", 45),
+  ("Books", 30),
+  ("Electronics", 300),
+  ("Groceries", 150),
+  ("Apparel", 100),
+  ("Books", 70)
+)
+
+val numPartitions = 4
+
+val salesRdd: RDD[(String, Int)] = sc.parallelize(salesData, numPartitions)
+
+println(s"Original RDD Partitioner: ${salesRdd.partitioner}")
+// Original RDD Partitioner: None
+
+val defaultPartitionedContents = salesRdd.mapPartitionsWithIndex {
+(partitionId, iterator) =>
+      iterator.map { element => 
+      (partitionId, element) }
+}
+
+println(s"Key-unaware distribution of keys across $numPartitions partitions:")
+defaultPartitionedContents.collect().foreach(println)
+// (0,(Electronics,500))
+// (0,(Books,20))
+// (1,(Zen-Decor,385))
+// (1,(Electronics,1300))
+// (1,(Groceries,45))
+// (2,(Books,30))
+// (2,(Electronics,300))
+// (3,(Groceries,150))
+// (3,(Apparel,100))
+// (3,(Books,70))    
+
+
+val groupedRdd: RDD[(String, Iterable[Int])] = salesRdd.groupByKey()
+println(s"Grouped RDD Partitioner: ${groupedRdd.partitioner}")
+// Grouped RDD Partitioner: Some(org.apache.spark.HashPartitioner@4)
+
+val partitionedContents = groupedRdd.mapPartitionsWithIndex {
+(partitionId, iterator) =>
+      iterator.map { case (key, value) => 
+      (partitionId, key, key.hashCode() % numPartitions, value) }.toList.iterator
+}
+
+println(s"Key-aware distribution of keys across $numPartitions partitions:")
+partitionedContents.collect().foreach(println)
+// (1,Apparel,1,Seq(100))
+// (2,Books,2,Seq(20, 30, 70))
+// (3,Electronics,-1,Seq(500, 1300, 300))
+// (3,Zen-Decor,3,Seq(385))
+// (3,Groceries,-1,Seq(45, 150))    
+----
+
+The Pair RDD `salesRdd`, created by `parallelize`, has no `Partitioner` set (`None`). 
+As RDD `defaultPartitionedContents` shows, the data of `salesRdd` is distributed across the 4 partitions based on the order of the source list, not the keys. 
+This is why pairs with key `"Electronics"` appear in partitions 0, 1, and 2.
+
+In contrast, `groupedRdd` (the result of `groupByKey`) must co-locate keys, so Spark implicitly applies a partitioner (`HashPartitioner`) to ensure this.
+The `partitionedContents` shows what this key-aware layout looks like: all `"Apparel"` pairs are in partition 1, all `"Books"` pairs in partition 2, and all `"Electronics"`, `"Groceries"`, and `"Zen-Decor"` pairs are co-located in partition 3.
+No pairs end up in partition 0.
+Once `groupByKey` has co-located the data, it produces its final result by transforming all the pairs for a given key into a single record: `(key, Iterable[values])`.
+====
+
+==== Explicit partitioning
+Explicit (or '`manual`') partitioning is a deliberate optimization strategy performed by a developer in a program.
+
+Explicit partitioning is achieved by calling `partitionBy`.
+
+[source, scala]
+def partitionBy(partitioner: Partitioner): RDD[(K, V)]
+
+This transformation returns a copy of the RDD partitioned using the specified partitioner.
+
+// WRONG (from last year's slides:) If `mapSideCombine` is true, Spark will group values of the same key together on the map side before the repartitioning, to only send each key over the network once. 
+// If a large number of duplicated keys are expected, and the size of the keys are large `mapSideCombine` should be set to true.
+
+Calling `partitionBy` on an RDD is not for the immediate result, but to pre-arrange the data in a key-aware layout with the goal of allowing subsequent operations to run without shuffling data.
+This can lead to order-of-magnitude performance improvements.
+Consider persisting the result of `partitionBy`, because otherwise the partitioning (and shuffling) is repeatedly applied each time the partitioned RDD is used.
+
+It's important to note that a Pair RDD is _not_ automatically partitioned by its keys upon creation.
+When you first create a Pair RDD (e.g., via `parallelize` or a `map` transformation on a regular RDD), it simply inherits its parent's partitioning.
+This initial partitioning is typically <<sec:default-partitioning, not key-aware>> and is instead based on data locality or the order of source elements, as demonstrated for `parallelize` in <<exa:implicit-partitioning>>.
+To gain the performance benefits of a key-aware layout, the freshly constructed pairs must be explicitly re-partitioned using a `Partitioner`. 
+
+==== Hash partitioning
+Hash partitioning is the most common partitioning strategy in Spark and the default for most key-based shuffle operations like `reduceByKey` and `join`.
+Its goal is to ensure that all pairs with the same key are sent to the same worker node.
+Spark provides the built-in class `HashPartitioner` for this purpose. 
+
+[source, scala]
+new HashPartitioner(numPartitions: Int)
+
+This partitioner hashes identical keys to the same partition using the following straightforward formula:
+
+[source, scala]
+val mod = key.hashCode() % numPartitions 
+partition = mod + (if (mod < 0) numPartitions else 0)
+
+Each pair's key is hashed using Java's `Object.hashCode`, and the result modulo the total number of partitions is used to determine which partition the pair belongs to.
+If the resulting key hash is negative, the computed modulo will be too, in which case `numPartitions` is added to end up with a non-negative partition.
+
+Hash partitioning guarantees co-location: all pairs with the same key will be on the same partition. 
+However, it makes absolutely no guarantees about the order of the keys within or between the partitions. 
+For example, when keys are characters, keys `'A'`, `'Z'`, and `'X'` might end up in the same partition, observed in that order.
+
+[[exa:hash-partitioning]]
+====
+The program in <<exa:implicit-partitioning>> illustrates hash partitioning.
+After implicitly applying the `HashPartitioner`, all pairs with the same key are in the same partition.
+Note that `key.hashCode() % numPartitions` for both `"Electronics"` and `"Groceries"` is `-1`, but `numPartitions` is added to ensure a non-negative partition id (`3`).
+====
+
+==== Range partitioning
+Range partitioning organizes a Pair RDD's data based on a total ordering of its keys.
+This method groups keys into contiguous ranges, ensuring that all keys within a specific range reside on the same partition.
+For example, a range partitioner might send all keys from `'A'` to `'F'` to partition 0, keys from `'G'` to `'M'` to partition 1, and so on.
+
+Range partitioning is essential for operations that require the data to be globally sorted.
+A common use case is the `sortByKey` transformation, which implicitly uses `RangePartitioner` to reorganize the data into its final, sorted order across the cluster.
+
+[source, scala]
+new RangePartitioner(numPartitions: Int, rdd: RDD[(K, V)], ascending: Boolean = true)
+
+To define the actual ranges, Spark first analyzes the distribution of keys in the RDD, which is therefore passed as an argument.
+This happens by sampling the dataset to get a small, representative collection of of keys.
+From this sample, Spark calculates the '`cut-off`' points that will divide the entire dataset into the specified number of partitions, aiming to make each partition roughly the same size.
+
+Range partitioning guarantees sorting between partitions (global order) and within partitions (local order), something `HashPartitioner` does _not_ provide.
+However, it only guarantees a global ordering based on the key, but it does not guarantee any secondary sorting on the values.
+
+[[exa:range-partitioning]]
+====
+The code example below demonstrates implicit range partitioning by applying transformation `sortByKey`.
+The combination of local and global ordering results in a globally sorted RDD, allowing a `collect` of the data in sorted order.
+This order is strictly key-based, and does not take into account any other values, as the sales amounts of `"Electronics"` in partition 0 demonstrates.
+
+[source, scala]
+----
+// (ProductCategory, SaleAmount)
+val salesData = List(...)
+
+val salesRdd: RDD[(String, Int)] = sc.parallelize(salesData)
+
+val numPartitions = 2
+
+// implicit range partitioning
+val sortedSalesRdd: RDD[(String, Int)] = salesRdd.sortByKey(ascending = true, numPartitions)
+println(s"sorted sales RDD Partitioner: ${sortedSalesRdd.partitioner}")
+// sorted sales RDD Partitioner: Some(org.apache.spark.RangePartitioner@ff058e19)
+
+val partitionContents = sortedSalesRdd.mapPartitionsWithIndex {
+(partitionId, iterator) =>
+      iterator.map { case (key, value) => (partitionId, key, value) }.toList.iterator
+}
+
+println(s"Distribution of keys across $numPartitions partitions:")
+partitionContents.collect().foreach(println)
+// (0,Apparel,100)
+// (0,Books,20)
+// (0,Books,30)
+// (0,Books,70)
+// (0,Electronics,500)
+// (0,Electronics,1300)
+// (0,Electronics,300)
+// (1,Groceries,45)
+// (1,Groceries,150)
+// (1,Zen-Decor,385)
+----
+====
+
+==== Custom Partitioning
+While Spark's built-in `HashPartitioner` and `RangePartitioner` cover most common use cases, you can also implement your own custom partitioner. 
+This allows you to control data co-location based on specific, domain-aware logic. 
+It is a powerful optimization technique to group data in a way that is meaningful for your specific problem. 
+
+For example, you might want to partition a dataset of user events by geographic region, or ensure that all records from the same customer (even with different keys) end up on the same worker node.
+
+Custom partitioning is different from the built-in partitioners because it allows control over the physical layout of an RDD based on a derived property of keys while preserving the original key, making the RDD available for future joins.
+
+<<ex:custom-partitioning>> requires the implementation of a custom partitioner for Top-Level Domains.
+
+== Narrow and Wide Transformations
+While all transformations in Spark are declared in the same way, they are not equal in terms of computational cost and complexity. 
+The performance cost of a transformation is determined by the dependency it creates between the partitions of a parent RDD and a child RDD. 
+This dependency comes in two types: narrow and wide.
+
+=== Narrow dependencies
+A narrow dependency is a simple link in the lineage where each child partition depends on _at most one_ input partition from its parent RDD.
+Transformations like `map` and `filter` create narrow dependencies because they can be computed independently on each partition.
+
+This one-to-one relationship is highly efficient for two main reasons:
+
+// In a narrow dependency, each output partition depends on at most one parent partition.
+// Because of that one-to-one (or one-to-zero) relationship, Spark can schedule the child partition to be computed on the same executor (worker node) that holds the parent partition’s data.
+
+. No shuffle required: the computation for each partition is self-contained. 
+Spark can compute output partitions in parallel on the worker nodes where the required input partitions already reside, without any network communication between workers.
+
+. Pipelining is possible: Spark can <<sec:pipelining, '`pipeline`'>> or fuse multiple consecutive narrow transformations into a single stage. 
+This allows a record to be processed through the entire chain of transformations in memory in a single pass.
+
+As a result, narrow dependencies preserve the parent RDD's partitioning scheme: the child RDD will have the same number of partitions, located on the same workers.
+
+[[exa:narrow-dependencies]]
+.Examples of narrow dependencies.
+====
+[[fig:narrow-dependencies]]
+.Narrow dependencies.
+image::narrow-dependencies.png[,400]
+
+<<fig:narrow-dependencies>> depicts two examples of narrow dependencies.
+The narrow dependency on the left is the result of transformations such as `B = A.map(...)` and `B = A.filter(...)`.
+`B` follows the partitioning of `A`.
+The narrow dependency on the right is the result of transformation `C = A.union(B)`.
+`C` is partitioned according to `A` and `B`.
+====
+
+[[sec:pipelining]]
+=== Pipelining
+Pipelining is how Spark executes a chain of narrow transformations within a single stage.
+Instead of computing the full intermediate RDD for each transformation, Spark fuses them and performs all the operations on each data element in a single pass. 
+Pipelining reduces I/O by avoiding the materialization of intermediate datasets. 
+It optimizes the depth of the computation for each record.
+
+For example, in a `map(...).filter(...)` chain, a single record from the source data will pass through the map function and then immediately through the filter function in memory, without the entire intermediate map result ever being written.
+
+[[exa:pipelining]]
+====
+In standard Scala, collections are processed _eagerly_. 
+Each transformation creates and fully populates a new intermediate collection.
+In the example code below, a full intermediate list `squares` is created in memory before the `filter` operation can even begin.
+
+[source,scala]
+----
+val numbers = List(1, 2, 3, 4, 5)
+// creates a new, complete intermediate list: List(1, 4, 9, 16, 25)
+val squares = numbers.map(n => n * n)
+// creates the final list from the intermediate list
+val largeSquares = squares.filter(sq => sq > 10)
+// result: List(16, 25)
+----
+
+Spark fuses the narrow transformations into a single stage and processes the data in a single pass, without creating the intermediate RDD.
+When `collect` is called, Spark processes ('`pushes`') each element through the entire pipeline individually.
+No full intermediate collection of `[1, 4, 9, 16, 25]` is ever created in memory.
+
+[source,scala]
+----
+val numbersRdd = sc.parallelize(1 to 5)
+// logical plan (lineage) created, but does nothing yet
+val largeSquaresRdd = numbersRdd.map(n => n * n)
+                                .filter(sq => sq > 10)
+// action triggers the pipelined execution
+largeSquaresRdd.collect()
+
+// 1 -> map(1*1) ->  1 -> filter( 1 > 10) -> (discarded)
+// 2 -> map(2*2) ->  4 -> filter( 4 > 10) -> (discarded)
+// 3 -> map(3*3) ->  9 -> filter( 9 > 10) -> (discarded)
+// 4 -> map(4*4) -> 16 -> filter(16 > 10) -> (kept)
+// 5 -> map(5*5) -> 25 -> filter(25 > 10) -> (kept)
+----
+====
+
+
+[[sec:wide-dependencies]]
+=== Wide dependencies
+A wide dependency is a complex link in the lineage where partitions of a child RDD depend on _multiple_ parent partitions.
+It creates a logical requirement for data from multiple parent partitions to be combined to compute a single child partition.
+
+The following commonly used transformations create a wide dependency:
+
+* Grouping: `groupByKey`, `groupBy`, `cogroup`
+
+* Aggregation by key: `combineByKey`, `reduceByKey`, `foldByKey`, `aggregateByKey`, 
+
+* Sorting: `sortBy`, `sortByKey`
+
+* Joins: `join`, `leftOuterJoin`, `rightOuterJoin`, `fullOuterJoin`, `cartesian`
+
+* Repartitioning: `repartition`, `coalesce` (when `shuffle = true`), `distinct`
+
+* Set operations: `union`, `subtract`, `intersection`
+
+[[exa:wide-dependencies]]
+.Examples of wide dependencies.
+====
+[[fig:wide-dependencoes]]
+.Wide dependencies.
+image::wide-dependencies.png[,400]
+
+<<fig:wide-dependencies>> depicts two examples of wide dependencies.
+The wide dependency on the left is the result of transformation such as `B = A.groupByKey()`.
+The wide dependency on the right is the result of transformation `C = A.join(B)`.
+====
+
+=== Partitioner Preservation for Pair RDDs
+// When discussing partitioning preservation it is important to make a  distinction between the physical and logical layout.
+
+// Preserving the partitioning scheme (the data layout) is a physical property. 
+// It means the number of partitions remains the same, and the data does not move between worker nodes.
+// If, for some operation, data has to move between worker nodes, this is called a <<sec:shuffling, shuffle>>.
+
+Partitioner preservation is the act of keeping the existing `Partitioner` object from the parent RDD, rather than removing it or replacing it with a new one.
+It is a _logical_ property that only applies to Pair RDDs, and is different from the physical property of preserving the partitioning scheme (the data layout) of any type of RDD.
+The partitioner is the metadata that Spark's optimizer uses to know that the data is organized by key, which allows it to skip future shuffles.
+
+When considering whether transformations preserve partitioners, a useful distinction can be made between narrow and wide transformations.
+
+==== Narrow Transformations
+The absence of a (full) physical shuffle for narrow transformations does not imply that the partitioner is preserved.
+Instead, whether a unary narrow transformation on a Pair RDD preserves the parent's `Partitioner` depends on whether the key-partition mapping is invalidated or not.
+Only in the latter case is the partitioner is preserved.
+The key-partition mapping can be invalidated by either changing keys or partitions.
+
+Transformations like `mapValues` and `filter` do not aim to repartition and are guaranteed _not_ to change the key of a pair.
+Because the key doesn't change, the original partitioning scheme is still valid, and the child RDD inherits the partitioner from its parent. 
+If a parent partitioner is present (i.e., not `None`), then this is highly efficient as it allows subsequent key-based operations to avoid a shuffle.
+
+A general-purpose transformation like `map` loses the partitioner. 
+Even if the mapped function doesn't change the key, Spark cannot guarantee it, so it drops the partitioning information (the partitioner becomes `None`) to be safe. 
+This can lead to a needless shuffle in a subsequent wide transformation.
+
+Even when a narrow transformation inherently cannot change keys, preservation of the partitioner is not guaranteed.
+For example, binary narrow transformation `union` removes the partitioner, _unless_ the two parent RDDs have exactly the same partitioner.
+`coalesce` merges existing partitions, but this merging breaks the parent's key-to-partition mapping, removing the partitioner.
+
+==== Wide Transformations
+A wide transformation _may_ require a physical shuffle to redistribute data across the cluster based on the actual transformation (e.g., grouping by key). 
+A shuffle inherently destroys the parent RDD's partitioning scheme, and the resulting RDD will always have a new set of partitions and a new partitioner that reflects the logic of the shuffle operation.
+When no data has to move between workers, for example when reducing by key on <<sec:avoiding-shuffles, co-partitioned>> pairs, the output RDD inherits the partitioner from its parent.
+
+[exa:co-partitioned-join]
+====
+[source, scala]
+----
+val partitioner = new HashPartitioner(2);
+val a = sc.parallelize(Seq((1, "A"), (2, "B"))).partitionBy(partitioner)
+val b = sc.parallelize(Seq((1, "x"), (2, "y"))).partitionBy(partitioner)
+val joined = a.join(b)
+
+println(joined.partitioner.equals(a.partitioner))
+// true
+println(joined.partitioner.equals(b.partitioner))
+// true
+----
+====
+
+[[sec:shuffling]]
+== Shuffling 
+All <<sec:narrow-transformation, narrow transformations>> preserve the partitioning scheme, i.e., the physical data layout. 
+A narrow transformation processes each parent partition independently to produce a child partition. 
+For example, when you run a `map` or a `filter` on an RDD with 100 partitions, the resulting RDD will also have 100 partitions, and the computation for each partition will happen locally.
+
+When a Spark program contains a <<sec:wide-transformation, wide transformation>>, this creates a wide dependency in the RDD's lineage.
+The consequence is that a single output partion depends on multiple input partitions.
+To satisfy the logical requirement of a wide dependency, Spark typically must perform a massive, cluster-wide data reorganization known as a shuffle. 
+A shuffle is the physical process of redistributing data across the network so that all related data (e.g., records with the same key in case of Pair RDDs) are co-located.
+
+The act of shuffling inherently destroys the original data layout and creates a new one. 
+The RDD resulting from a shuffle therefore has a new set of <<sec:partitioning, partitions>>.
+
+Shuffles must be avoided in Spark because they are the single most expensive operation, introducing significant overhead that can dominate a job's runtime.
+This overhead comes from disk and network I/O required to perform the actual shuffle, and the required serialization/deserialization of objects in the process.
+Shuffling also prevents optimizations such as Spark's efficient in-memory <<sec:pipelining, pipelining>>.
+
+You can detect that a shuffle has occurred by inspecting the runtime return type of a transformation (`ShuffledRDD`), or by using function `toDebugString` to see the execution plan of an RDD.
+
+[[sec:avoiding-shuffles]]
+[[sec:co-partitioning]]
+=== Avoiding Shuffles
+Transformations on two large Pair RDDs that require data with the same key to be co-located typically trigger an expensive shuffle.
+A `join` and its variations are the most common example, but other key-based operations such as '`explicit`' grouping operations `cogroup` and `groupWith`, and set-like operations such as `subtractByKey` require co-location of keys.
+
+However, if you can ensure that both RDDs are <<sec:partitioning, partitioned>> with the exact same partitioner, Spark can skip the shuffle entirely for these operations.
+This is because the system knows that records for the same key from both RDDs are already on the same worker node.
+Because the _logical_ wide dependency is satisfied without a physical shuffle, it becomes as efficient as a narrow transformation.
+
+'`Co-partitioning`' is the act of partitioning two or more Pair RDDs using the exact same `Partitioner`, and focuses on the logical partitioning structure.
+'`Co-location`' means that all pairs with the same key physically reside on the same worker node.
+It is the result of co-partitioning using `partitionBy`, or from implicit partitioning from other transformations.
+
+// initial (explicit) shuffle still required, of course
+
+.Wide dependency and shuffle.
+====
+In the program below, both RDDs have <<sec:default-partitioning, no partitioning>> information.
+Spark must shuffle both to ensure matching keys are in the same partition.
+
+[source, scala]
+----
+val a = sc.parallelize(Seq((1, "A"), (2, "B")))
+val b = sc.parallelize(Seq((1, "x"), (2, "y")))
+val joined = a.join(b)
+----
+====
+
+.Co-partitioned `join`.
+====
+In the program below, both RDDs use the same `HashPartitioner` on the same key space.
+Spark detects matching partitioners, so no physical shuffle is needed during execution.
+// (or '`map-side`') 
+
+[source, scala]
+----
+val a = sc.parallelize(Seq((1, "A"), (2, "B"))).partitionBy(new HashPartitioner(2))
+val b = sc.parallelize(Seq((1, "x"), (2, "y"))).partitionBy(new HashPartitioner(2))
+val joined = a.join(b)
+----
+====
+
+Because `partitionBy` is a <<sec:transformations, lazy transformation>>, Spark will re-execute the expensive partitioning shuffle every time the resulting RDD is used in a subsequent action. 
+To make co-partitioning effective and avoid redundant work, the co-partitioned RDDs should almost always be <<sec:persistence, persisted>> immediately after partitioning.
+This materializes the co-located state to memory or disk after it's computed the first time, allowing multiple future operations like `join` or `cogroup` to run without needing to re-shuffle the data. 
+
+=== Minimizing Overhead of Shuffles
+When a shuffle is unavoidable, the primary goal is to minimize the amount of data that is written to disk and sent over the network.
+This can be achieved through three main strategies: pre-partitioning, pre-aggregating, and early filtering of data.
+
+[[sec:pre-partitioning]]
+==== Pre-partitioning
+While co-partitioning is an optimization for operations between two or more RDDs, pre-partitioning is the act of applying a `Partitioner` to a _single_ RDD. 
+The goal is to make a subsequent wide transformation on that same RDD much more efficient.
+
+For example, if you call `groupByKey` on a pre-partitioned RDD, the grouping can happen _locally_ on each worker node because all the keys are already where they need to be, minimizing massive cross-network data transfers.
+Of course, as always, the expensive shuffle caused by pre-partitioning must be persisted to really take advantage of this optimization.
+
+[[sec:map-side-combine]]
+==== Pre-aggregate data before the shuffle (map-side combine)
+A very effective way to reduce shuffle traffic is to perform as much aggregation as possible on each worker node before the shuffle begins.
+This is often called a '`map-side combine`'.
+// The DAG clearly identifies where wide transformations (shuffles) are necessary.
+// By analyzing the full graph, Spark's optimizer can apply strategies to minimize the amount of data that must be sent over the network.
+
+The classic example of this is choosing `reduceByKey` over `groupByKey`.
+
+* `groupByKey` shuffles all the original key-value pairs across the network.
+The grouping happens on the reducer side after the data has been transferred.
+
+* `reduceByKey` is optimized to perform a local reduction on each worker node first. 
+It combines all values for a given key within each partition and sends only one aggregated value per key from that partition over the network.
+
+* `aggregateKey` is fundamentally designed to perform a map-side combine. 
+It achieves this by forcing you to provide two distinct functions: the '`local`' operation that runs within a partition before the shuffle, and the '`global`' one that runs after the shuffle to combine the local results.
+
+====
+Consider a simple word count. 
+If a single partition contains `("Car", 1)``, `("Car", 1)`, `("Car", 1)`, `groupByKey` would send all three pairs over the network. 
+<<exa:mapreduce-word-count>> depicts a scenario in which there is no reduce before shuffling.
+
+In contrast, `reduceByKey` would aggregate the three pairs locally and send only a single pair, `("Car", 3)`, significantly reducing the data transfer.
+====
+
+[[sec:filter-early]]
+==== Filter early
+Another strategy to reduce shuffle overhead is to apply `filter` transformations as early as possible in your job's lineage. 
+By removing unnecessary data upfront, you reduce the size of the RDDs that are processed in later stages. 
+This has a cascading effect, meaning less data will need to be processed, stored, and ultimately shuffled.
+
+// Partitioning after join: follows left RDD partition?
+
+[[sec:fault-tolerance]]
+== Fault-Tolerance
+Lineages are the key to fault tolerance in Spark.
+// RDDs are immutable, transformations such as `map`, `flatMap`, `filter` are used to do functional transformations on this immutable data without requiring checkpointing or writing to disk.
+// RDDs store the function that applies this transformation on their parent RDD to compute their dataset as part of their internal representation.
+Whenever partitions are lost, for example because nodes on which these partitions reside in a cluster crash, Spark does not rerun the entire job again.
+Instead, it recovers from failure by recomputing only lost partitions based on their lineage.
+
+Partition recovery is a transitive process, in which the partitions that a lost partition depended on, also have to be recovered, up until the source for data in a partition (in memory or on disk) is reached, which can then be restored.
+The process then moves in the other direction by transitively restoring the partitions that depend on a restored partition.
+
+=== Narrow Transformations
+[[exa:fault-tolerance-narrow]]
+.Fault-tolerance for narrow transformations.
+====
+Imagine you are processing a large log file distributed across a 3-node cluster. 
+Your goal is to count the number of critical error lines.
+The relevant code is the following, and the resulting lineage is straightforward.
+
+[source,scala]
+----
+val logLines = sc.textFile("huge.log")
+val criticalLines = logLines.filter(_.contains("CRITICAL"))
+criticalLines.count()
+----
+
+When executing the `count` action, Spark sends tasks to each worker to read their partitions of `huge.log` and apply the filter.
+
+Suppose that workers 1 and 3 processes its partitions successfully, but worker 2 crashes when it is halfway through processing its partitions.
+At this point, the job has failed because the intermediate data partitions that were on worker 2 are lost.
+Spark's driver detects this failure and the lost partitions. 
+Instead of re-running the entire job, it consults the lineage graph for the lost partitions. 
+It knows they were being created by applying the `filter` operation to specific partitions of the original `huge.log` file.
+It then finds a healthy worker node (e.g., worker 1 or 3, or a new one), 
+and sends a new task to that healthy worker with the command to read the lost partitions from `huge.log` and apply the `filter` function to them.
+The healthy worker recomputes the lost partitions, and once they are recreated, the final `count` aggregation can be completed successfully. 
+This is far more efficient than traditional checkpointing, as it only requires the original source data to be available.
+====
+
+<<exa:fault-tolerance-narrow>> is an example of what happens when narrow transformations are involved when failure arises.
+It shows lineage-based failure recovery at its most efficient.
+Recomputing the lost data in these cases is cheap because Spark only needs to re-read the original parent partition from a reliable source (like from disk) and apply the operations again.
+
+=== Wide Transformations
+Fault tolerance for wide transformations is significantly more complex and computationally expensive than for narrow ones.
+In this case, lineage dictates that to recompute a lost partition, Spark must read the data from _all_ parent partitions that contributed to the shuffle, and _re-execute_ the entire shuffle operation (including disk I/O and network I/O).
+This is a massive, cluster-wide operation.
+
+[[exa:fault-tolerance-narrow-wide]]
+.Narrow vs. wide transformations for fault-tolerance.
+====
+.Failure involving narrow transformations.
+image::fault-tolerance-narrow.png[,400]
+
+<<fig:fault-tolerance-narrow>> contains an example lineage graph containing both narrow and wide transformations. 
+Assume that the partition of RDD `F` decorated by the yellow warning sign is lost.
+In this case, tracing the lineage of that partition over two narrow transformations (`union` and `map`) indicates all the partitions that must be recovered in order to recover the lost partition of `F`.
+
+.Failure involving wide transformations.
+image::fault-tolerance-wide.png[,400]
+
+Next, consider <<fig:fault-tolerance-wide>>, where Spark has already made further progress in computing the job, but this time a partition of RDD `G` is lost.
+Again using lineage to trace back all partitions that contributed to the lost partition paints another picture, as now almost all partitions must be computed.
+This is because `join` in this example a wide transformation (and not co-partitioned), as is `groupByKey`.
+====
+
+<<fig:fault-tolerance-wide>> is an illustration of why it is adviced to '`persist after a wide transformation`' comes in. 
+By persisting (caching) the RDD that results from a shuffle, you are essentially creating a new, much cheaper recovery point in your lineage.
+
+If a worker fails while processing a job that depends on this persisted RDD, Spark no longer needs to re-execute the expensive shuffle.
+Instead, it can simply read the lost partition from its cached location (in memory or on another node's disk). 
+This makes fault recovery significantly faster and is a critical optimization for complex, multi-stage jobs.
+
+[[sec:execution]]
+== Execution
+
+// Spark groups as many consecutive narrow transformations as possible into a single stage.
+// A _stage_ is a set of tasks that can be executed together, in parallel, without a network shuffle.
+// This is efficient because all the operations within that stage can be _pipelined_, meaning they can be performed in memory on each partition without any data movement between worker nodes.
+
+
+Executing a Spark program starts with a  driver program on the driver node in which `SparkSession` (and therefore `SparkContext`) is available.
+The `main` method of your Spark program always runs on this driver node.
+On the driver node you do not actually execute tasks to process RDDs.
+
+There are also worker nodes, which are also configured to run Spark.
+On each worker node there is an Executor running.
+Executors are the processes that run computations and store the data.
+
+The Cluster Manager is the component responsible for acquiring and managing the computing resources (CPU, memory, etc.) across the cluster for a Spark application.
+
+It acts as the bridge between your Spark application and the physical machines. 
+When your Driver Program starts, it connects to the Cluster Manager and requests a set of resources, typically in the form of Executor processes.
+
+The Cluster Manager's job is to keep an inventory of all available resources on the Worker Nodes, negotiate with the Spark driver to fulfill its resource requests, and launch the executor processes on the worker nodes on behalf of the application.
+// When an action is applied, that is when true execution starts and the worker nodes spring into action.
+// To divide the work among the worker nodes, there is a cluster manager.
+
+Once the executors are running, they communicate directly with the driver. 
+Spark is designed to be agnostic to the underlying manager, and it can run on several common ones, such as Spark Standalone (simple cluster manager included with Spark), Apache YARN, Apache Mesos, and Kubernetes.
+
+.Spark jobs.
+image::spark-job-execution.png[,400]
+
+
+// Both the DAG Scheduler and the Task Scheduler reside within the Driver Program.
+// They are core components of the driver's orchestration process, created by the SparkSession.
+// * DAG Scheduler: 
+// This is the high-level scheduler. 
+// When you call an action, it takes your RDD's lineage graph and converts it into a physical execution plan made of stages.
+// * Task Scheduler: 
+// This is the low-level scheduler. 
+  // It takes the stages from the DAG Scheduler and is responsible for launching the individual tasks on the executors via the Cluster Manager. 
+  // It also handles task retries in case of failures.
+
+[[sec:execution-flow]]
+=== Execution Flow
+When you call an action in the driver program, the following happens:
+
+. Lineage creation: Spark creates the full lineage DAG representing all the transformations.
+
+. Stage creation: the DAG scheduler examines the lineage graph (the logical plan) and breaks it into stages (the physical plan), splitting it at every shuffle that is the consequence of a wide transformation.
+At each shuffle boundary data must be written, redistributed across the network, and then read again by the next set of tasks.
+This shuffle operation becomes the input for the next stage.
+Stage creation works backward from the final action, and Spark tries to be as clever as possible to optimize things.
+For example, it is at this point that pipelining (fusing chains of narrow transformations) is applied.
+
+. Task creation: the DAG scheduler submits the tasks for each stage to the Task Scheduler. 
+A stage consists of multiple parallel tasks, one for each partition of the data that needs to be computed.
+
+. Execution: the Task Scheduler launches these tasks on the worker nodes.
+The workers execute the tasks in one stage, write their shuffled output, and then the workers for the next stage read that output and continue processing.
+Once all tasks are complete, the final result of the action is calculated and sent back to the Driver Program.
+
+Understanding where code executes is one of the most critical concepts in Spark. 
+Examples <<exa:action-foreach>> and <<exa:action-collect>> contrast two different approaches to printing data, highlighting the difference between running code on the remote worker nodes versus the central driver program.
+
+[[exa:action-foreach]]
+====
+The following program prints the log lines in `huge.log` that contain the string `"CRITICAL"`.
+The action `foreach` is an eager operation that immediately launches a Spark job to process every element in the RDD.
+The function `println`, given to `foreach`, prints to the console.
+However, the `println` function executes on the worker nodes, and its output will appear in the executor logs, not on the driver node (unless you are running in local mode).
+Action `foreach` itself returns nothing (`Unit`).
+
+[source, scala]
+----
+val logLines = sc.textFile("huge.log")
+val criticalLines = logLines.filter(_.contains("CRITICAL"))
+criticalLines.foreach(println)
+----
+====
+
+[[exa:action-collect]]
+====
+In the program below, `collect`` is the Spark action that brings the entire RDD to the driver as a standard Scala array (`Array[String]`).
+In contrast to <<exa:action-foreach>>, the subsequent `foreach` is the standard Scala method, which now _does_ run on the driver and prints to the main console.
+
+[source, scala]
+----
+val logLines = sc.textFile("huge.log")
+val criticalLines = logLines.filter(_.contains("CRITICAL"))
+criticalLines.collect().foreach(println)
+----
+====
+
+=== Distributing transformations and actions
+
+.Distributing transformations
+Transformations are easy to distribute because they rely on data parallelism.
+An RDD's data is already distributed over the cluster.
+The logic of a transformation (like the function inside a `map` or `filter`) or a chain of transformations, which is sent to the data on each worker node, is very small.
+Because the transformation logic is self-contained and each element can be processed independently, the workload is perfectly parallelizable.
+
+.The challenge of distributing actions
+While transformations are easily parallelized, aggregating the distributed results back into a single value on the driver, as many actions perform, requires careful consideration of which operations are parallelizable. 
+The RDD API is modeled on Scala's collections, but it cannot support operations that are inherently sequential.
+
+Consider the signature for `foldLeft`, which is not supported on RDDs.
+
+[source, Scala]
+def foldLeft(z: B)(op: (B, A) => B): B
+
+When workers communicate result values of type `B` to the driver, then the driver does not know how to combine these values into a single value of type `B`.
+Therefore, a `foldLeft` cannot be performed in parallel, and the operation is not supported on RDDs.
+
+The option of having the operations defined that require slow, serial execution, makes the performance of Spark programs even harder to deduce, and people will (inadvertently) use the operation. 
+Additionally, performing serial work on a cluster is harder than it seems, so having serial reduction operations on RDDs is not a good option.
+
+Spark's API only includes reduction actions that can be correctly _and_ efficiently executed in parallel.
+Action `fold`, for example, is parallelizable because its return type is the same as the RDD's element type.
+
+[source, scala]
+def fold(z: A)(op: (A, A) => A): A
+
+Because the driver needs to combine two intermediate results of type A, and the op function has the signature (A, A) => A, the driver can simply reuse the same function to combine the results from the workers.
+Operation `op` must be commutative and associative because Spark provides no guarantee about the order in which it will combine intermediate results.
+
+`aggregate` is the most general and powerful parallel aggregation operator. 
+It solves the problem of `foldLeft` by explicitly asking for a second function just for combining the intermediate results.
+
+[source, scala]
+def aggregate[B](z: B)(seqop: (B, A) => B, combop: (B, B) => B): B
+
+`seqop` is the '`sequence operator`' that's applied on each worker to aggregate the elements within a single partition (like the `op` in `foldLeft`).
+`combop` is the '`combine operator`' that the driver uses to merge the intermediate results (of type `B`) from each worker.
+
+Because aggregate can return a different type `B` than the source RDD's type `A`, it's extremely useful for projecting complex data into a simpler summary.
+Note that we already used `aggregateByKey` for the same purpose, and `map` and `reduceByKey` too in <<exa:pair-rdd-map-down>> when motivating Pair RDDs.
+However, in those example a new, distributed RDD is created where values have been aggregated on a per-key basis, with the goal of using this RDD in later stages.
+Action `aggregate`, on the other hand, computes a single, final result and returns it to the driver program. 
+
+== Conclusion
+This chapter detailed the Resilient Distributed Dataset (RDD) abstraction, which provides a functional, fault-tolerant model for batch processing. 
+While RDDs successfully abstract away low-level concerns like fault recovery, handling it automatically via lineage and recomputation, this abstraction introduces a new, higher-level set of responsibilities.
+
+Ironically, although RDDs enable developers to overcome many low-level challenges of distributed computation, those same developers must be acutely aware of what Spark is doing "`under the hood`" to achieve good performance. 
+Spark hands developers the tools, but developers have to use them wisely.
+
+This responsibility centers on managing the physical execution plan Spark derives from the logical RDD graph.
+The primary determinant of performance is the distinction between narrow dependencies (e.g., `map`, `filter`), which are efficient and permit in-memory pipelining within a single stage, and wide dependencies (e.g., `groupByKey`, `join`).
+These wide dependencies define stage boundaries and necessitate a shuffle, which is a costly, cluster-wide data redistribution that dominates runtime.
+
+The entire Pair RDD API, with its Partitioner mechanism, is the toolkit Spark provides to manage this bottleneck.
+Optimizations such as preferring `reduceByKey` (map-side combine) over `groupByKey`, or explicitly using `partitionBy` and persist to achieve co-partitioning before a `join`, are not automatic.
+They are deliberate, non-obvious strategies the developer must use to control the physical data layout and prevent the shuffle from becoming an expensive bottleneck.
+
+''''
+
+[[exe:batch]]
+== Exercises
+
+=== Preliminaries
+
+.Exercise projects
+The archetype project to base yourself upon for the exercises in this section is `hello-spark`.
+We suggest to copy and rename this project for each exercise.
+
+Parts that must be modified include the code (obviously), and potentially the parameters at the top of `build.sbt`.
+
+// The `build.sbt` file provided supports two main ways for running Spark jobs:
+
+// . Running Spark jobs locally using `sbt run`.  DOES NOT (ALWAYS) WORK!
+// Spark will start a local cluster to run your job.
+// This requires Spark's libraries to be on the classpath.
+// `fork := true` allows `sbt run` to successfully execute Spark applications locally.
+// This setting launches a separate JVM for your application, allowing Spark to manage its own memory and resources.
+
+// . Submitting Spark jobs to the Spark cluster
+// `sbt assembly` compiles your Spark job into a jar (named `myProject.jar` by default), which can then be submitted to a Spark cluster using `spark-submit`.
+// This should be considered the '`default`' way of working with Spark, with the local `sbt run` just as a fast and easy (debug) option.
+
+The `build.sbt` file provided enables submitting Spark jobs as jar files to the Spark cluster.
+`sbt assembly` compiles your Spark job into a jar (named `myProject.jar` by default), which can then be submitted to a Spark cluster using `spark-submit`.
+
+A Spark cluster is headed by a Spark Master, that receives submitted jobs and acts as a central coordinator and resource manager, communication with any worker nodes in the cluster.
+In principle, a job can also be submitted and run locally by specifying a local master (`local[*]`).
+
+      spark-submit --class example.Hello --master local[*] target/scala-2.13/myProject.jar
+
+// However, this is not really that different from using `sbt run` (but could still be an interesting intermediate step, for debugging purposes for example).
+
+This is interesting for quick testing and debugging purposes.
+
+For the most realistic testing, you should submit your job to the Spark Master running in a dedicated container at `spark-master:7077` as follows.
+
+      spark-submit --class example.Hello --master spark://spark-master:7077 target/scala-2.13/myProject.jar
+
+You can find these and other example commands in the `README.MD` files in the example projects.
+You can familiarize yourself with the `spark-submit` command https://spark.apache.org/docs/latest/submitting-applications.html[here].
+
+NOTE: Be sure to substitute or change the names of classes, jars, etc. where required in these and other provided example commands.
+
+.Datasets
+In the exercises we will refer to datasets or other files containing data, which can be found in `{dataset-dir}`.
+Please always use this full '`local`' host path in your code, because Docker volumes have been set up to mount exactly this path for the Spark Master and Worker containers.
+This is important when submitting a job to the cluster, as it ensures that the (non-local) Spark containers can access the datasets using the same path as when running with master `local[*]`.
+
+[[ex:word-count]]
+=== Exercise 1: Word count
+As already mentioned, the '`hello world`' of Big Data processing is counting the occurrences of each word in a text.
+<<exa:mapreduce-word-count>> shows how this can be accomplished based on pairs using per-key aggregation.
+
+. Implement word counting using Pair RDDs, and count words in the file `hamlet.txt`.
+
+. Reason about the efficiency of your implementation.
+For example, are you avoiding shuffles or minimizing their overhead?
+
+Your program should output something like the following data:
+
+      (And,243)
+      (operant,1)
+      (garland,1)
+      (fear'd,1)
+      (lunacy?,1)
+      (born,1)
+      (garden,1)
+      (thin,1)
+      (consider,2)
+      (nill,1)
+      (turn.,1)
+      (bugs,1)
+      (growing,1)
+      (hell,4)
+      (endure,1)
+      (breathe,3)
+      ...
+
+[[ex:wiki-logs-english]]
+=== Exercise 2: Wiki logs English pages
+We work with the `wiki-logs-english-pages.txt` dataset.
+// this dataset only contains "en"
+
+TIP: In vscode, you can select the dataset file, right-click, and select "Copy path".
+You can paste this path in the source code when specifying the path of the file (dataset) to load.
+
+Each line of the log contains a record consisting of the following fields, where pageName is unique for each record:
+
+      language pageName accessCount contentSize
+
+Using this dataset, write a Spark program that computes the following information, and run it in a local instance of Spark.
+
+. The number of different pages accessed (which is not necessarily the same as the total number of page accesses).
+
+. The total number of page accesses.
+
+. The most accessed page.
+
+// TODO could add "language with the most number of different pages"
+// TODO could add "language with the most number of page accesses"
+// ... to have better connection and reformulation of next exercise
+
+Your program should output the following data:
+
+      Number of different pages accessed: 1850701
+      Total number of page accesses: 5280924
+      Most accessed page: Main_Page
+
+TIP: when running _locally_, you can insert a `System.in.read()` after printing to '`pause`' the application and avoid scrolling back through the full output (logs).
+
+=== Exercise 3: Full Wiki logs
+This exercise uses the `wiki-logs-full.txt` dataset, which has the same record format as the smaller dataset.
+However, the `language` field is can now have entries with suffixes. 
+// TODO ^ make this an exercise
+
+Write a Spark program that computes the following information, and run it in a local instance of Spark.
+// this dataset contains "en", "en.mw", "en.voy", ... for different projects within Wikimedia
+// TODO maybe as exercise dump all the different languages 
+
+// should also look at Pair RDDs (table language -> total number of accesses)
+
+. The total number of accesses to Dutch pages (starting with `"nl"`).
+
+. The language with the most number of page accesses _except_ English (starting with `"en"`).
+
+Your program should output the following data:
+
+      Total number of accesses to Dutch pages: 170447
+      Second-most popular language in terms of page accesses: es
+
+Again, reason about the efficiency of your implementation.      
+
+=== Exercise 4: Persisting (TODO)
+
+TODO: persist() exercise.
+Do not use local[*] for testing (which runs everything on same JVM shared-memory(?)).
+Submitting to Spark master in Docker is also on same CPU but network communication/serialization is required.
+
+[[ex:custom-partitioning]]
+=== Exercise 5: Web log partitioning
+Imagine you have a large RDD of web server logs, keyed by the full domain name. 
+You want to re-partition this data so that all domains from the same Top-Level Domain (TLD) (e.g., all `.com` domains, all `.be` domains, ...) are guaranteed to be in the same partition. 
+This could be useful for an analysis where you want to process data by geographic or organizational region.
+
+. Implement a custom partitioner.
+
+Define a new class that extends `org.apache.spark.Partitioner`. 
+You only need to implement three methods, with `getPartition` being the most important.
+
+[source, scala]
+----
+import org.apache.spark.Partitioner
+
+class TldPartitioner(numParts: Int) extends Partitioner {
+ 
+  // the total number of partitions to create
+  override def numPartitions: Int = numParts
+  
+  // returns the partition ID (from 0 to numPartitions-1) for any given key
+  override def getPartition(key: Any): Int = ...
+
+  // returns true if other is identical to this partitioner
+  override def equals(other: Any): Boolean = ...
+}
+----
+
+. Apply the custom partitioner
+
+Check whether the partitioner works as expected.
+
+[source, scala]
+----
+// (Domain, LogLine)
+val logData = List(
+  ("www.google.com", "GET /search 200"), ("www.vub.be", "GET / 200"), ("www.facebook.com", "POST /login 200"),
+  ("research.vub.be", "GET /papers 200"), ("ads.google.com", "GET /adclick 200"), ("analytics.google.com", "POST /track 200"),
+  ("belgium.be", "GET /info 200"), ("wikipedia.org", "GET /wiki/Spark 200"), ("images.google.com", "GET /img 200"),
+  ("developer.spark.apache.org", "GET /docs 200"), ("mail.google.com", "POST /send 200"), ("github.com", "GET /spark 200"),
+  ("info.vub.be", "GET /contact 200"), ("spark.apache.org", "GET / 200"), ("news.google.com", "GET /headlines 200"),
+  ("my.vub.be", "POST /login 200"), ("info.belgium.be", "GET /fgov 200"), ("en.wikipedia.org", "GET /wiki/RDD 200"),
+  ("scholar.google.com", "GET /search 200"), ("www.apache.org", "GET / 200"), ("stackoverflow.com", "GET /questions 200"),
+  ("www.fgov.be", "GET / 200"), ("trends.google.com", "GET / 200"), ("accounts.google.com", "POST /auth 200"),
+  ("github.com", "POST /commit 200"), ("sourceforge.net", "GET /projects 200"), ("europa.eu", "GET / 200"),
+  ("es.wikipedia.org", "GET /wiki/Datos 200"), ("my.vub.ac.be", "GET / 200"), ("blog.google.com", "GET / 200"),
+  ("packages.vub.be", "GET /list 200"), ("pypi.org", "GET /package/pyspark 200"), ("cran.r-project.org", "GET /web/packages 200"),
+  ("download.apache.org", "GET /spark 200"), ("ietf.org", "GET /rfc 200"), ("w3.org", "GET /standards 200"),
+  ("cisco.com", "GET / 800"), ("docs.python.org", "GET /3/ 200"), ("developer.apple.com", "GET / 200"),
+  ("mozilla.org", "GET /firefox 200"), ("php.net", "GET / 200"), ("mysql.com", "GET / 200"),
+  ("mongodb.com", "GET / 200"), ("redis.io", "GET / 200"), ("fmi.be", "GET /weather 200"),
+  ("rtbf.be", "GET /news 200"), ("vrt.be", "GET /nieuws 200"), ("ieee.org", "GET /standards 200"),
+  ("acm.org", "GET /dl 200"), ("speedtest.net", "POST /results 200")
+)
+
+val logRdd = sc.parallelize(logData)
+val partitionedRdd = logRdd.partitionBy(...)
+
+val partitionContents = partitionedRdd.mapPartitionsWithIndex { 
+(partitionId, iterator) =>
+      iterator.map { case (key, value) => (partitionId, key) }
+}
+
+println("--- Data distribution after custom TldPartitioner ---")
+partitionContents.collect().foreach(println)
+----
+
+// POSSIBLE exercises:
+
+// groupByKey cannot profit from co-partitioning because co-partitioning is an optimization for operations that involve two or more RDDs, like a join. Since groupByKey is a unary operation that works on only a single RDD, there is no "other" RDD to be co-partitioned with.
+
+// skews when partitioning
