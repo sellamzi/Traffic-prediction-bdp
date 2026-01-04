@@ -10,3 +10,5 @@ dataset/
 exercises/
 text/bdp.pdf
 **/checkpointDir/
+.venv/
+**/.venv/
